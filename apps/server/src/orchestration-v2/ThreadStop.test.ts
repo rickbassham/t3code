@@ -1,3 +1,4 @@
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -52,23 +53,25 @@ const adapter = {
   openSession: () => Effect.die("Runs here never reach a provider"),
 } as ProviderAdapter.ProviderAdapterV2["Service"];
 const layerDatabase = SqlitePersistence.layerMemory;
-const layerTest = ThreadManagementService.layer.pipe(
-  Layer.provideMerge(
-    Layer.mergeAll(
-      layerDatabase,
-      ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
-      EventStore.layer.pipe(Layer.provide(layerDatabase)),
-      EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
-      ProviderReplayHarness.layerWithRegistry(
-        { name: "thread-stop" },
-        ProviderAdapterRegistry.layerFromAdapters([adapter]),
-        { databaseLayer: layerDatabase, runEffectWorker: false },
+const layerTest = ThreadManagementService.layer
+  .pipe(Layer.provide(WorktreeProtectionTestkit.layer))
+  .pipe(
+    Layer.provideMerge(
+      Layer.mergeAll(
+        layerDatabase,
+        ProjectionStore.layer.pipe(Layer.provide(layerDatabase)),
+        EventStore.layer.pipe(Layer.provide(layerDatabase)),
+        EffectOutbox.layer.pipe(Layer.provide(layerDatabase)),
+        ProviderReplayHarness.layerWithRegistry(
+          { name: "thread-stop" },
+          ProviderAdapterRegistry.layerFromAdapters([adapter]),
+          { databaseLayer: layerDatabase, runEffectWorker: false },
+        ),
       ),
     ),
-  ),
-  Layer.provideMerge(ServerSettings.layerTest()),
-  Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-);
+    Layer.provideMerge(ServerSettings.layerTest()),
+    Layer.provideMerge(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+  );
 
 const encodeEffectRequest = Schema.encodeSync(Schema.fromJsonString(OrchestrationEffectRequestV2));
 
@@ -535,9 +538,9 @@ it.effect.each([1, 2, 8])(
         yield* threads.stopDelegatedTasks({ threadId: rootThreadId, commandId });
       }).pipe(
         Effect.provide(
-          Layer.fresh(ThreadManagementService.layer).pipe(
-            Layer.provide(Layer.succeed(Orchestrator.OrchestratorV2, measuredOrchestrator)),
-          ),
+          Layer.fresh(
+            ThreadManagementService.layer.pipe(Layer.provide(WorktreeProtectionTestkit.layer)),
+          ).pipe(Layer.provide(Layer.succeed(Orchestrator.OrchestratorV2, measuredOrchestrator))),
         ),
       );
 

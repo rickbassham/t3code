@@ -1,3 +1,4 @@
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, describe, it } from "@effect/vitest";
 import {
@@ -1726,17 +1727,19 @@ describe("OrchestratorMcpService provider resolution", () => {
               [projectId]: { providerInstances: { [codexInstanceId]: { enabled: parentEnabled } } },
             },
           });
-          const layerThreads = ThreadManagementService.layer.pipe(
-            Layer.provideMerge(layerOrchestrator),
-            Layer.provide(
-              LegacyV1ThreadImporter.layer.pipe(
-                Layer.provide(layerOrchestrator),
-                Layer.provide(layerDatabase),
+          const layerThreads = ThreadManagementService.layer
+            .pipe(Layer.provide(WorktreeProtectionTestkit.layer))
+            .pipe(
+              Layer.provideMerge(layerOrchestrator),
+              Layer.provide(
+                LegacyV1ThreadImporter.layer.pipe(
+                  Layer.provide(layerOrchestrator),
+                  Layer.provide(layerDatabase),
+                ),
               ),
-            ),
-            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-            Layer.provideMerge(layerSettings),
-          );
+              Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+              Layer.provideMerge(layerSettings),
+            );
           const layerTest = layerOrchestratorService.pipe(
             Layer.provideMerge(layerThreads),
             Layer.provide(

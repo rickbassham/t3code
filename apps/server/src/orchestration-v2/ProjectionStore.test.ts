@@ -760,6 +760,67 @@ const threadWorktreePathsIncludeArchivedOnRequest = Effect.gen(function* () {
     { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" },
     { threadId: ThreadId.make("thread:archived"), worktreePath: "/worktrees/archived" },
   ]);
+  assert.deepEqual(
+    yield* store.getThreadWorktreePaths({ includeArchived: true, includeDeleted: true }),
+    [
+      { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" },
+      { threadId: ThreadId.make("thread:archived"), worktreePath: "/worktrees/archived" },
+      { threadId: ThreadId.make("thread:deleted"), worktreePath: "/worktrees/deleted" },
+    ],
+  );
+});
+
+const busyRetiredRunRetainsWorktree = Effect.gen(function* () {
+  const store = yield* ProjectionStore.ProjectionStoreV2;
+  const now = yield* DateTime.now;
+  const threadId = yield* addRolledBackRecoveryCandidate("busy-retired-worktree");
+  const projection = yield* store.getThreadProjection(threadId);
+  const run = projection.runs[0];
+  assert.isDefined(run);
+  yield* store.apply({
+    id: EventId.make("event:busy-retired:archive"),
+    type: "thread.archived",
+    threadId,
+    occurredAt: now,
+    payload: {
+      ...projection.thread,
+      branch: "busy-retired",
+      worktreePath: "/worktrees/busy-retired",
+      archivedAt: now,
+    },
+  });
+  yield* store.apply({
+    id: EventId.make("event:busy-retired:running"),
+    type: "run.updated",
+    threadId,
+    runId: run.id,
+    occurredAt: now,
+    payload: { ...run, status: "running", completedAt: null },
+  });
+  const ownPaths = (options?: { includeBusyRetired?: boolean }) =>
+    store
+      .getThreadWorktreePaths(options)
+      .pipe(Effect.map((rows) => rows.filter((row) => row.threadId === threadId)));
+  assert.deepEqual(yield* ownPaths(), []);
+  assert.deepEqual(yield* ownPaths({ includeBusyRetired: true }), [
+    { threadId, worktreePath: "/worktrees/busy-retired" },
+  ]);
+  yield* store.apply({
+    id: EventId.make("event:busy-retired:completed"),
+    type: "run.updated",
+    threadId,
+    runId: run.id,
+    occurredAt: now,
+    payload: { ...run, status: "completed", completedAt: now },
+  });
+  assert.deepEqual(yield* ownPaths({ includeBusyRetired: true }), []);
+  yield* store.apply({
+    id: EventId.make("event:busy-retired:clear-workspace"),
+    type: "thread.metadata-updated",
+    threadId,
+    occurredAt: now,
+    payload: { ...projection.thread, branch: null, worktreePath: null, archivedAt: now },
+  });
 });
 
 const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
@@ -849,6 +910,10 @@ it.effect(
   "memory worktree path lookup defaults to active threads and can include archived threads",
   () =>
     threadWorktreePathsIncludeArchivedOnRequest.pipe(Effect.provide(ProjectionStore.layerMemory)),
+);
+
+it.effect("memory busy retired runs retain worktrees until completion", () =>
+  busyRetiredRunRetainsWorktree.pipe(Effect.provide(ProjectionStore.layerMemory)),
 );
 
 it.effect("memory projection keeps restart-cancelled work through a stale run.updated", () =>
@@ -1219,6 +1284,62 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
   it.effect(
     "worktree path lookup defaults to active threads and can include archived threads",
     () => threadWorktreePathsIncludeArchivedOnRequest,
+  );
+  it.effect(
+    "busy retired runs retain worktrees until completion",
+    () => busyRetiredRunRetainsWorktree,
+  );
+  it.effect("retains retired worktree references until pending detach effects finish", () =>
+    Effect.gen(function* () {
+      yield* threadWorktreePathsIncludeArchivedOnRequest;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      for (const id of ["thread:archived", "thread:deleted"]) {
+        yield* sql`INSERT INTO orchestration_v2_effect_outbox (
+          effect_id,command_id,thread_id,effect_type,payload_json,status,
+          available_at,created_at,updated_at
+        ) VALUES (${`detach:${id}`},'test:detach',${id},'provider-session.detach','{}','pending',
+          '2026-01-01','2026-01-01','2026-01-01')`;
+      }
+      assert.deepEqual(yield* store.getThreadWorktreePaths({ includeBusyRetired: true }), [
+        { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" },
+        { threadId: ThreadId.make("thread:archived"), worktreePath: "/worktrees/archived" },
+        { threadId: ThreadId.make("thread:deleted"), worktreePath: "/worktrees/deleted" },
+      ]);
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status='succeeded' WHERE command_id='test:detach'`;
+      assert.deepEqual(yield* store.getThreadWorktreePaths({ includeBusyRetired: true }), [
+        { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" },
+      ]);
+    }),
+  );
+
+  it.effect("retains the old provider cwd after a thread moves until detach completes", () =>
+    Effect.gen(function* () {
+      yield* threadWorktreePathsIncludeArchivedOnRequest;
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const sql = yield* SqlClient.SqlClient;
+      yield* sql`INSERT INTO orchestration_v2_projection_provider_sessions (
+        provider_session_id,thread_id,provider,driver,provider_instance_id,status,model,updated_at,payload_json
+      ) VALUES ('session:moved','thread:active','codex','codex','codex','ready','test','2026-01-01',
+        ${JSON.stringify({ cwd: "/worktrees/old" })})`;
+      yield* sql`INSERT INTO orchestration_v2_effect_outbox (
+        effect_id,command_id,thread_id,effect_type,payload_json,status,available_at,created_at,updated_at
+      ) VALUES ('detach:moved','test:moved','thread:active','provider-session.detach',
+        ${JSON.stringify({ providerSessionId: "session:moved" })},'pending','2026-01-01','2026-01-01','2026-01-01')`;
+      const oldPath = () =>
+        store
+          .getThreadWorktreePaths({ includeBusyRetired: true })
+          .pipe(Effect.map((rows) => rows.filter((row) => row.worktreePath === "/worktrees/old")));
+      assert.deepEqual(yield* oldPath(), [
+        { threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/old" },
+      ]);
+      assert.deepEqual(
+        (yield* store.getThreadWorktreePaths()).filter((row) => row.threadId === "thread:active"),
+        [{ threadId: ThreadId.make("thread:active"), worktreePath: "/worktrees/active" }],
+      );
+      yield* sql`UPDATE orchestration_v2_effect_outbox SET status='succeeded' WHERE effect_id='detach:moved'`;
+      assert.deepEqual(yield* oldPath(), []);
+    }),
   );
 
   it.effect(

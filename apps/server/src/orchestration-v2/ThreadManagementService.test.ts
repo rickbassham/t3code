@@ -1,6 +1,7 @@
 import { expect, it } from "@effect/vitest";
 import {
   CommandId,
+  GitCommandError,
   MessageId,
   NodeId,
   type OrchestrationV2Command,
@@ -11,7 +12,7 @@ import {
   ProviderDriverKind,
   ProviderSessionId,
   type OrchestrationV2StoredEvent,
-  type OrchestrationV2ThreadProjection,
+  OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadShell,
   ProjectId,
   ProviderInstanceId,
@@ -27,6 +28,7 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
+import * as Schema from "effect/Schema";
 import * as Stream from "effect/Stream";
 import * as TestClock from "effect/testing/TestClock";
 
@@ -39,6 +41,7 @@ import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import { DispatchModeLimit, type DispatchModeRefusal } from "./DispatchModeLimit.ts";
 
 it("stamps authoritative provenance on commands that create threads or messages", () => {
@@ -278,8 +281,209 @@ const layerReceiptsTest = CommandReceiptStore.layer.pipe(
   Layer.provide(SqlitePersistence.layerMemory),
 );
 
+const worktreeCreateCommand = {
+  type: "thread.create",
+  commandId: CommandId.make("command:protected-worktree"),
+  threadId: ThreadId.make("thread:protected-worktree"),
+  projectId: ProjectId.make("project:protected-worktree"),
+  title: "Protected workspace",
+  modelSelection: { instanceId: ProviderInstanceId.make("codex"), model: "test" },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: "feature/protected",
+  worktreePath: "/worktrees/protected",
+  createdBy: "user",
+  creationSource: "web",
+} satisfies OrchestrationV2Command;
+
+const worktreeReferenceCommands = [
+  worktreeCreateCommand,
+  {
+    type: "thread.metadata.update",
+    commandId: CommandId.make("command:attach-protected"),
+    threadId: worktreeCreateCommand.threadId,
+    worktreePath: worktreeCreateCommand.worktreePath,
+  },
+  {
+    type: "thread.unarchive",
+    commandId: CommandId.make("command:reopen-protected"),
+    threadId: worktreeCreateCommand.threadId,
+  },
+  {
+    type: "thread.fork",
+    commandId: CommandId.make("command:fork-protected"),
+    sourceThreadId: worktreeCreateCommand.threadId,
+    targetThreadId: ThreadId.make("thread:protected-fork"),
+    sourcePoint: { type: "run", runId: RunId.make("run:protected-fork") },
+    createdBy: "user",
+    creationSource: "web",
+  },
+  {
+    type: "delegated_task.request",
+    commandId: CommandId.make("command:delegate-protected"),
+    parentThreadId: worktreeCreateCommand.threadId,
+    parentRunId: RunId.make("run:protected-parent"),
+    parentNodeId: NodeId.make("node:protected-parent"),
+    task: "Inspect the workspace",
+    modelSelection: worktreeCreateCommand.modelSelection,
+    runtimeMode: "full-access",
+    interactionMode: "default",
+    createdBy: "agent",
+    creationSource: "mcp",
+  },
+] satisfies ReadonlyArray<OrchestrationV2Command>;
+
+const worktreeProjection = Schema.decodeUnknownSync(OrchestrationV2ThreadProjection)({
+  thread: {
+    ...worktreeCreateCommand,
+    id: worktreeCreateCommand.threadId,
+    providerInstanceId: worktreeCreateCommand.modelSelection.instanceId,
+    activeProviderThreadId: null,
+    lineage: {
+      parentThreadId: null,
+      relationshipToParent: null,
+      rootThreadId: worktreeCreateCommand.threadId,
+    },
+    forkedFrom: null,
+    createdAt: DateTime.makeUnsafe("2026-10-22T00:00:00Z"),
+    updatedAt: DateTime.makeUnsafe("2026-10-22T00:00:00Z"),
+    archivedAt: DateTime.makeUnsafe("2026-10-22T00:00:00Z"),
+    settledOverride: null,
+    settledAt: null,
+    lastVisitedAt: null,
+    deletedAt: null,
+  },
+  runs: [],
+  attempts: [],
+  nodes: [],
+  subagents: [],
+  providerSessions: [],
+  providerThreads: [],
+  providerTurns: [],
+  runtimeRequests: [],
+  messages: [],
+  plans: [],
+  turnItems: [],
+  checkpointScopes: [],
+  checkpoints: [],
+  contextHandoffs: [],
+  contextTransfers: [],
+  visibleTurnItems: [],
+  updatedAt: DateTime.makeUnsafe("2026-10-22T00:00:00Z"),
+});
+
+const layerWorktreeDispatchTest = (
+  withReference: WorktreeProtection.WorktreeProtection["Service"]["withReference"],
+  committed: Ref.Ref<boolean>,
+) =>
+  ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({ withReference })),
+    Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
+    Layer.provide(
+      Layer.mock(Orchestrator.OrchestratorV2)({
+        getThreadRecords: () => Effect.succeed(worktreeProjection),
+        dispatch: () => Ref.set(committed, true).pipe(Effect.as({ sequence: 1, storedEvents: [] })),
+      }),
+    ),
+    Layer.provide(ServerSettings.layerTest()),
+    Layer.provide(layerReceiptsTest),
+  );
+
+it.effect.each(worktreeReferenceCommands)(
+  "protects the workspace before committing $type",
+  (command) =>
+    Effect.gen(function* () {
+      const entered = yield* Deferred.make<void>();
+      const released = yield* Deferred.make<void>();
+      const committed = yield* Ref.make(false);
+      const withReference: WorktreeProtection.WorktreeProtection["Service"]["withReference"] = (
+        _input,
+        effect,
+      ) =>
+        Deferred.succeed(entered, undefined).pipe(
+          Effect.andThen(Deferred.await(released)),
+          Effect.andThen(effect),
+        );
+      yield* Effect.gen(function* () {
+        const service = yield* ThreadManagementService.ThreadManagementService;
+        const dispatch = yield* service.dispatch(command).pipe(Effect.forkChild);
+        yield* Deferred.await(entered);
+        expect(yield* Ref.get(committed)).toBe(false);
+        yield* Deferred.succeed(released, undefined);
+        yield* Fiber.join(dispatch);
+        expect(yield* Ref.get(committed)).toBe(true);
+      }).pipe(Effect.provide(layerWorktreeDispatchTest(withReference, committed)));
+    }).pipe(Effect.scoped),
+);
+
+it.effect("serializes a source workspace move with an inherited fork reference", () =>
+  Effect.gen(function* () {
+    const forkCommand = worktreeReferenceCommands.find((command) => command.type === "thread.fork");
+    if (forkCommand === undefined) throw new Error("Fork fixture is missing");
+    const entered = yield* Deferred.make<void>();
+    const released = yield* Deferred.make<void>();
+    const moveStarted = yield* Deferred.make<void>();
+    const attempts = yield* Ref.make(0);
+    const committed = yield* Ref.make(false);
+    const withReference: WorktreeProtection.WorktreeProtection["Service"]["withReference"] = (
+      _input,
+      effect,
+    ) =>
+      Ref.update(attempts, (count) => count + 1).pipe(
+        Effect.andThen(Deferred.succeed(entered, undefined)),
+        Effect.andThen(Deferred.await(released)),
+        Effect.andThen(effect),
+      );
+    yield* Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      const fork = yield* service.dispatch(forkCommand).pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const move = yield* Deferred.succeed(moveStarted, undefined).pipe(
+        Effect.andThen(
+          service.dispatch({
+            type: "thread.metadata.update",
+            commandId: CommandId.make("command:concurrent-workspace-move"),
+            threadId: forkCommand.sourceThreadId,
+            worktreePath: "/worktrees/next",
+          }),
+        ),
+        Effect.forkChild,
+      );
+      yield* Deferred.await(moveStarted);
+      yield* TestClock.adjust("0 seconds");
+      expect(yield* Ref.get(attempts)).toBe(1);
+      yield* Deferred.succeed(released, undefined);
+      yield* Fiber.join(fork);
+      yield* Fiber.join(move);
+      expect(yield* Ref.get(attempts)).toBe(2);
+    }).pipe(Effect.provide(layerWorktreeDispatchTest(withReference, committed)));
+  }).pipe(Effect.scoped),
+);
+
+it.effect("rejects an unprotectable workspace before committing its thread reference", () =>
+  Effect.gen(function* () {
+    const committed = yield* Ref.make(false);
+    const failure = new GitCommandError({
+      operation: "WorktreeProtection.protect",
+      command: "git worktree lock",
+      cwd: "/repo",
+      detail: "Could not protect the workspace.",
+    });
+    const withReference: WorktreeProtection.WorktreeProtection["Service"]["withReference"] = () =>
+      Effect.fail(failure);
+    yield* Effect.gen(function* () {
+      const service = yield* ThreadManagementService.ThreadManagementService;
+      const error = yield* service.dispatch(worktreeCreateCommand).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(Orchestrator.OrchestratorCommandRejectedError);
+      expect(error.cause).toBe(failure);
+      expect(yield* Ref.get(committed)).toBe(false);
+    }).pipe(Effect.provide(layerWorktreeDispatchTest(withReference, committed)));
+  }),
+);
+
 const layerThreadManagementTest = (settingsLayer: ReturnType<typeof ServerSettings.layerTest>) =>
   ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
     Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
     Layer.provide(Layer.mock(Orchestrator.OrchestratorV2)({})),
     Layer.provide(settingsLayer),
@@ -359,6 +563,7 @@ it.effect("inherits the machine value when the project has no override", () => {
 const layerDispatchChokepointTest =
   (settingsLayer: ReturnType<typeof ServerSettings.layerTest>) => (dispatched: Array<string>) =>
     ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -483,6 +688,7 @@ it.effect("classifies projection infrastructure failures separately from a missi
     cause: infrastructureCause,
   });
   const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
     Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
@@ -519,6 +725,7 @@ it.effect("uses thread-not-found only after a projection loads outside the proje
     },
   } as OrchestrationV2ThreadProjection;
   const layerTest = ThreadManagementService.layer.pipe(
+    Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
     Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
     Layer.provide(
       Layer.mock(Orchestrator.OrchestratorV2)({
@@ -547,6 +754,7 @@ it.effect("preserves failed legacy materialization when reading checkpoint conte
     cause: new Error("checkpoint import failed"),
   });
   const layerTest = ThreadManagementService.layerWithLegacyImporter.pipe(
+    Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
     Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
     Layer.provide(
       Layer.mergeAll(
@@ -591,6 +799,7 @@ it.effect.each([
         runs: status === "missing" ? [] : [{ id: runId, status }],
       }) as unknown as OrchestrationV2ThreadProjection;
     const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -659,6 +868,7 @@ it.effect("waitForThread reads the run again only when the run updates", () =>
     const stored = (sequence: number, event: object) =>
       ({ sequence, event: { threadId, ...event } }) as unknown as OrchestrationV2StoredEvent;
     const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -718,6 +928,7 @@ it.effect("waitForThread follows a restart continuation instead of the cut run",
     const stored = (sequence: number, event: object) =>
       ({ sequence, event: { threadId, ...event } }) as unknown as OrchestrationV2StoredEvent;
     const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -781,6 +992,7 @@ it.effect("waitForThread returns the cut run once its continuation is declined",
     const declined = yield* Deferred.make<void>();
     let pending = true;
     const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({
@@ -922,6 +1134,7 @@ it.effect.each([
           }),
     } as unknown as ProviderAdapter.ProviderAdapterV2SessionRuntime;
     const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(
         Layer.mergeAll(
           Layer.mock(Orchestrator.OrchestratorV2)({
@@ -1048,6 +1261,7 @@ it.effect.each([
     const runId = RunId.make("run:thread-management:settle-after-run");
     const dispatched: Array<string> = [];
     const layerTest = ThreadManagementService.layer.pipe(
+      Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
       Layer.provide(Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({})),
       Layer.provide(
         Layer.mock(Orchestrator.OrchestratorV2)({

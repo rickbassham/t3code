@@ -1,3 +1,5 @@
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { expect, it, vi } from "vite-plus/test";
 import { it as effectIt } from "@effect/vitest";
@@ -61,6 +63,7 @@ const normalize = (target: string) => {
 };
 const layerWorktreeLocation = (worktreesDir = managedWorktreesDir) =>
   Layer.mergeAll(
+    WorktreeProtectionTestkit.layer,
     Path.layer,
     Layer.mock(ServerConfig.ServerConfig)({ worktreesDir } as ServerConfig.ServerConfig["Service"]),
     ServerSettings.layerTest(),
@@ -122,9 +125,11 @@ function startWithMissingWorktree(
   const startRootRun = vi.fn(() => Effect.void);
   const pruneWorktrees = vi.fn(() => Effect.void);
   const createWorktree = vi.fn(() => Effect.succeed({} as never));
+  const protectWorktree = vi.fn(() => Effect.void);
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        WorktreeProtectionTestkit.layer,
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
         Layer.mock(EventSink.EventSinkV2)({ writeIfRunCurrent }),
         IdAllocator.layer,
@@ -144,6 +149,10 @@ function startWithMissingWorktree(
                 ),
         } as never),
         layerWorktreeLocation(),
+        Layer.mock(WorktreeProtection.WorktreeProtection)({
+          protect: protectWorktree,
+          withLease: (_input, effect) => effect,
+        }),
         Layer.mock(GitWorkflow.GitWorkflowService)({ pruneWorktrees, createWorktree }),
         Layer.mock(ProjectService.ProjectService)({
           getById: () =>
@@ -198,6 +207,7 @@ function startWithMissingWorktree(
     createWorktree,
     writeIfRunCurrent,
     startRootRun,
+    protectWorktree,
     projectionReads: () => projectionReadCount,
   };
 }
@@ -213,6 +223,10 @@ it("does not commit running state when inherited background routing cannot be re
   expect(harness.createWorktree).toHaveBeenCalledWith({
     cwd: "/tmp/provider-turn-start-project",
     refName: "feature/restore",
+    path: worktreePath,
+  });
+  expect(harness.protectWorktree).toHaveBeenCalledWith({
+    cwd: "/tmp/provider-turn-start-project",
     path: worktreePath,
   });
   expect(harness.writeIfRunCurrent).not.toHaveBeenCalled();
@@ -623,6 +637,7 @@ function makeLocalCommandHarness(input: {
   const layer = ProviderTurnStart.layer.pipe(
     Layer.provide(
       Layer.mergeAll(
+        WorktreeProtectionTestkit.layer,
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
           prepareProviderHandoff: () => Effect.die("history read must fail first"),
         }),

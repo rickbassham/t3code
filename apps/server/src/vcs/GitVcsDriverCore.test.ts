@@ -44,10 +44,12 @@ import {
 import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { gitConfigEnv } from "./VcsProcess.ts";
 import { makeProcessProbe, processProbeSource } from "../testUtils/processProbe.ts";
+import { WORKTREE_PROTECTION_REASON } from "../workspace/worktreeProtectionReason.ts";
 
 const encodeGitCommandError = Schema.encodeEffect(Schema.fromJsonString(GitCommandError));
 const decodeVcsRef = Schema.decodeUnknownSync(VcsRef);
 const decodeVcsListRefsResult = Schema.decodeUnknownSync(VcsListRefsResult);
+const decodeReviewDiffPreviewInput = Schema.decodeEffect(ReviewDiffPreviewInput);
 
 const layerServerConfig = ServerConfig.layerTest(process.cwd(), {
   prefix: "t3-git-vcs-driver-test-",
@@ -1792,7 +1794,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           const spawner = ChildProcessSpawner.make((command) => {
             if (
               ChildProcess.isStandardCommand(command) &&
-              (command.args.includes("worktree") || command.args[0] === "checkout")
+              (command.args.some(
+                (arg, index) => arg === "worktree" && command.args[index + 1] === "add",
+              ) ||
+                command.args[0] === "checkout")
             ) {
               locales.push(command.options.env?.LC_ALL);
             }
@@ -2623,6 +2628,11 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         }
         yield* git(cwd, ["add", "."]);
         yield* git(cwd, ["update-index", "--chmod=+x", "mode-only.sh"]);
+        if ((yield* HostProcess.Platform) !== "win32") {
+          const fs = yield* FileSystem.FileSystem;
+          const path = yield* Path.Path;
+          yield* fs.chmod(path.join(cwd, "mode-only.sh"), 0o755);
+        }
         yield* git(cwd, ["commit", "-m", "rename and add files"]);
         const preview = yield* driver.getReviewDiffPreview({
           cwd,
@@ -2631,7 +2641,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const branch = preview.sources.find((source) => source.kind === "branch-range")!;
         for (const path of ["renamed.md", "[literal].txt", " leading.txt", "mode-only.sh"]) {
           const stat = branch.files!.find((file) => file.path === path)!;
-          const request = yield* Schema.decodeEffect(ReviewDiffPreviewInput)({
+          const request = yield* decodeReviewDiffPreviewInput({
             cwd,
             baseRef: initialBranch,
             file: { path, previousPath: stat.previousPath, sourceKind: "branch-range" },
@@ -4157,6 +4167,200 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
   });
 
   describe("worktree operations", () => {
+    it.effect("protects new worktrees from ordinary Git cleanup", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "protected");
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/protected",
+        });
+
+        const removal = yield* Effect.result(git(cwd, ["worktree", "remove", worktreePath]));
+        assert.isTrue(Result.isFailure(removal));
+        assert.isTrue(yield* fs.exists(path.join(worktreePath, ".git")));
+        assert.include(
+          yield* git(cwd, ["worktree", "list", "--porcelain"]),
+          `locked ${WORKTREE_PROTECTION_REASON}`,
+        );
+        yield* writeTextFile(worktreePath, "draft.txt", "work can continue\n");
+        assert.equal(
+          yield* fs.readFileString(path.join(worktreePath, "draft.txt")),
+          "work can continue\n",
+        );
+      }),
+    );
+
+    it.effect("restores worktree protection when removal rejects uncommitted files", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "dirty-protected");
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/dirty-protected",
+        });
+        yield* writeTextFile(worktreePath, "draft.txt", "unsaved work\n");
+
+        const removal = yield* Effect.result(driver.removeWorktree({ cwd, path: worktreePath }));
+        assert.isTrue(Result.isFailure(removal));
+        assert.equal(
+          yield* fs.readFileString(path.join(worktreePath, "draft.txt")),
+          "unsaved work\n",
+        );
+        assert.include(
+          yield* git(cwd, ["worktree", "list", "--porcelain"]),
+          `locked ${WORKTREE_PROTECTION_REASON}`,
+        );
+        yield* fs.remove(path.join(worktreePath, "draft.txt"));
+        yield* driver.removeWorktree({ cwd, path: worktreePath });
+        assert.isFalse(yield* fs.exists(worktreePath));
+      }),
+    );
+
+    it.effect("preserves a manually locked worktree even for forced T3 removal", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "manual-lock");
+        yield* git(cwd, [
+          "worktree",
+          "add",
+          "-b",
+          "feature/manual-lock",
+          worktreePath,
+          initialBranch,
+        ]);
+        yield* git(cwd, [
+          "worktree",
+          "lock",
+          "--reason",
+          "Owner is using this checkout",
+          worktreePath,
+        ]);
+
+        const removal = yield* Effect.result(
+          driver.removeWorktree({ cwd, path: worktreePath, force: true }),
+        );
+        assert.isTrue(Result.isFailure(removal));
+        assert.isTrue(yield* fs.exists(path.join(worktreePath, ".git")));
+        assert.include(
+          yield* git(cwd, ["worktree", "list", "--porcelain"]),
+          "locked Owner is using this checkout",
+        );
+      }),
+    );
+
+    it.effect("preserves protected worktree registrations while a checkout is unavailable", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "unavailable");
+        yield* driver.createWorktree({
+          cwd,
+          path: worktreePath,
+          refName: initialBranch,
+          newRefName: "feature/unavailable",
+        });
+        yield* fs.remove(worktreePath, { recursive: true });
+
+        yield* git(cwd, ["worktree", "prune", "--expire", "now"]);
+        assert.include(yield* git(cwd, ["worktree", "list", "--porcelain"]), "feature/unavailable");
+        yield* driver.removeWorktree({ cwd, path: worktreePath });
+        assert.notInclude(
+          yield* git(cwd, ["worktree", "list", "--porcelain"]),
+          "feature/unavailable",
+        );
+      }),
+    );
+
+    it.effect.each([false, true])(
+      "recreates a missing protected checkout using a relative path: %s",
+      (relative) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const path = yield* Path.Path;
+          const fs = yield* FileSystem.FileSystem;
+          const driver = yield* GitVcsDriver.GitVcsDriver;
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "recoverable");
+          yield* driver.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: "feature/recoverable",
+          });
+          const head = yield* git(worktreePath, ["rev-parse", "HEAD"]);
+          yield* fs.remove(worktreePath, { recursive: true });
+          yield* driver.pruneWorktrees({ cwd });
+
+          yield* driver.createWorktree({
+            cwd,
+            path: relative ? path.relative(cwd, worktreePath) : worktreePath,
+            refName: "feature/recoverable",
+          });
+          assert.equal(yield* git(worktreePath, ["rev-parse", "HEAD"]), head);
+          assert.equal(
+            yield* git(worktreePath, ["branch", "--show-current"]),
+            "feature/recoverable",
+          );
+          assert.include(
+            yield* git(cwd, ["worktree", "list", "--porcelain"]),
+            `locked ${WORKTREE_PROTECTION_REASON}`,
+          );
+        }),
+    );
+
+    it.effect("does not clear a manual lock to recreate an unavailable checkout", () =>
+      Effect.gen(function* () {
+        const cwd = yield* makeTmpDir();
+        const { initialBranch } = yield* initRepoWithCommit(cwd);
+        const path = yield* Path.Path;
+        const fs = yield* FileSystem.FileSystem;
+        const driver = yield* GitVcsDriver.GitVcsDriver;
+        const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), "unavailable-manual");
+        yield* git(cwd, [
+          "worktree",
+          "add",
+          "--lock",
+          "--reason",
+          "Owner's offline disk",
+          "-b",
+          "feature/offline",
+          worktreePath,
+          initialBranch,
+        ]);
+        yield* fs.remove(worktreePath, { recursive: true });
+
+        const recovery = yield* driver
+          .createWorktree({ cwd, path: worktreePath, refName: "feature/offline" })
+          .pipe(Effect.result);
+        assert.isTrue(Result.isFailure(recovery));
+        assert.isFalse(yield* fs.exists(worktreePath));
+        assert.include(
+          yield* git(cwd, ["worktree", "list", "--porcelain"]),
+          "locked Owner's offline disk",
+        );
+      }),
+    );
+
     it.effect("uses parallel checkout without skipping filters or hooks", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();
@@ -4185,7 +4389,10 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
           baseRefName: initialBranch,
         });
 
-        assert.notInclude(yield* git(cwd, ["worktree", "list", "--porcelain"]), "locked");
+        assert.include(
+          yield* git(cwd, ["worktree", "list", "--porcelain"]),
+          `locked ${WORKTREE_PROTECTION_REASON}`,
+        );
         assert.equal(yield* fs.readFileString(path.join(worktreePath, "checkout-workers")), "0\n");
         assert.equal(yield* fs.readFileString(path.join(worktreePath, "asset.txt")), "filtered\n");
         assert.equal(
@@ -4682,6 +4889,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       (keepFile) =>
         Effect.gen(function* () {
           const cwd = yield* makeTmpDir();
+          yield* initRepoWithCommit(cwd);
           const fileSystem = yield* FileSystem.FileSystem;
           const pathService = yield* Path.Path;
           const outside = yield* makeTmpDir("git-worktree-link-target-");
@@ -4857,12 +5065,7 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
         const stalePath = pathService.join(worktreesRoot, "stale");
         const driver = yield* GitVcsDriver.GitVcsDriver;
 
-        yield* driver.createWorktree({
-          cwd,
-          path: stalePath,
-          refName: initialBranch,
-          newRefName: "feature/stale",
-        });
+        yield* git(cwd, ["worktree", "add", "-b", "feature/stale", stalePath, initialBranch]);
         yield* fileSystem.remove(stalePath, { recursive: true });
 
         yield* driver.removeWorktree({

@@ -38,6 +38,7 @@ import {
 } from "@t3tools/shared/git";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import * as ProjectService from "../project/ProjectService.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ManagedProjectFolders from "../project/ManagedProjectFolders.ts";
@@ -201,6 +202,7 @@ const make = Effect.gen(function* () {
   const cloneTracker = yield* ProjectCloneTracker.ProjectCloneTracker;
   const terminals = yield* TerminalManager.TerminalManager;
   const git = yield* GitWorkflow.GitWorkflowService;
+  const protection = yield* WorktreeProtection.WorktreeProtection;
   const setupScripts = yield* ProjectSetupScriptRunner.ProjectSetupScriptRunner;
   const providerRegistry = yield* ProviderRegistry.ProviderRegistry;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
@@ -455,8 +457,12 @@ const make = Effect.gen(function* () {
         yield* setupTracker.stageStatus(threadId, "checkout", "done");
       }
 
-      // A reused worktree is already recorded, and rewriting it could undo
-      // the first attempt's branch rename.
+      if (worktreePath !== null) {
+        yield* protection
+          .protect({ cwd: project.workspaceRoot, path: worktreePath })
+          .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
+      }
+      // Rewriting a reused worktree could undo the first attempt's branch rename.
       if (reused === undefined) {
         yield* threads
           .dispatch({

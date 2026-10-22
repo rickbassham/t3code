@@ -1,3 +1,4 @@
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import {
   AuthSessionId,
   type AuthEnvironmentScope,
@@ -107,11 +108,13 @@ it.effect("exports full history with size, scope, and missing-thread checks", ()
     const services = yield* Layer.build(
       Layer.mergeAll(
         runtime,
-        ThreadManagementService.layer.pipe(
-          Layer.provide(
-            Layer.mergeAll(runtime, CommandReceiptStore.layer, ServerSettings.layerTest({})),
+        ThreadManagementService.layer
+          .pipe(Layer.provide(WorktreeProtectionTestkit.layer))
+          .pipe(
+            Layer.provide(
+              Layer.mergeAll(runtime, CommandReceiptStore.layer, ServerSettings.layerTest({})),
+            ),
           ),
-        ),
         OrchestrationEventStore.layer,
         ProjectStore.layer,
       ).pipe(Layer.provideMerge(SqlitePersistence.layerMemory)),

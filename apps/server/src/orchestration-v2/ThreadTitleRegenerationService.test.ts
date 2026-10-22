@@ -1,3 +1,4 @@
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import { assert, describe, it, vi } from "@effect/vitest";
 import {
   type ChatAttachment,
@@ -56,11 +57,13 @@ function makeHarness(
     { databaseLayer: layerDatabase, runEffectWorker: false },
   );
   const layerServerSettings = ServerSettings.layerTest({});
-  const layerThreadManagement = ThreadManagement.layer.pipe(
-    Layer.provide(layerOrchestrator),
-    Layer.provide(layerServerSettings),
-    Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-  );
+  const layerThreadManagement = ThreadManagement.layer
+    .pipe(Layer.provide(WorktreeProtectionTestkit.layer))
+    .pipe(
+      Layer.provide(layerOrchestrator),
+      Layer.provide(layerServerSettings),
+      Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+    );
   const layerOutbox = EffectOutbox.layer.pipe(Layer.provide(layerDatabase));
   const generateThreadTitle = vi.fn(
     options.generateTitle ?? (() => Effect.succeed({ title: "Generated title" })),

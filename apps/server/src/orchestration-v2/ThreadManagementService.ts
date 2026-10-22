@@ -36,6 +36,7 @@ import {
   type TurnItemId,
 } from "@t3tools/contracts";
 import { threadTranscriptHeader } from "@t3tools/shared/threadTranscript";
+import * as KeyedLock from "@t3tools/shared/KeyedLock";
 import * as Context from "effect/Context";
 import * as DateTime from "effect/DateTime";
 import * as Duration from "effect/Duration";
@@ -56,6 +57,7 @@ import { DispatchModeLimit, exceededDispatchModeLimit } from "./DispatchModeLimi
 import { projectTurnItemForDetail } from "./WireProjection.ts";
 import * as LegacyV1ThreadImporter from "./legacy/LegacyV1ThreadImporter.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 
 export type ThreadManagementSendMode = "auto" | "queue" | "steer" | "restart";
 
@@ -514,6 +516,8 @@ const make = Effect.gen(function* () {
   const legacyImporter = yield* LegacyV1ThreadImporter.LegacyV1ThreadImporter;
   const serverSettings = yield* ServerSettings.ServerSettingsService;
   const receipts = yield* CommandReceiptStore.CommandReceiptStoreV2;
+  const protection = yield* WorktreeProtection.WorktreeProtection;
+  const referenceChanges = yield* KeyedLock.make<ThreadId>();
 
   const assertProviderInstanceEnabled: ThreadManagementServiceShape["assertProviderInstanceEnabled"] =
     (input) =>
@@ -669,10 +673,78 @@ const make = Effect.gen(function* () {
     }
   };
 
+  const commitCommand = Effect.fn("ThreadManagementService.commitCommand")(
+    function* (command: OrchestrationV2ServerCommand) {
+      const commit = orchestrator.dispatch(command);
+      if (command.type === "thread.create" && command.worktreePath !== null) {
+        if (yield* hasReceipt(command.commandId)) return yield* commit;
+        return yield* protection.withReference(
+          { projectId: command.projectId, worktreePath: command.worktreePath },
+          commit,
+        );
+      }
+      if (command.type === "thread.metadata.update" && command.worktreePath != null) {
+        if (yield* hasReceipt(command.commandId)) return yield* commit;
+        const { thread } = yield* orchestrator.getThreadRecords(command.threadId, []);
+        return yield* protection.withReference(
+          { projectId: thread.projectId, worktreePath: command.worktreePath },
+          commit,
+        );
+      }
+      const inheritedFrom =
+        command.type === "thread.fork"
+          ? command.sourceThreadId
+          : command.type === "thread.unarchive"
+            ? command.threadId
+            : command.type === "delegated_task.request" && command.workspaceStrategy === undefined
+              ? command.parentThreadId
+              : undefined;
+      if (inheritedFrom !== undefined) {
+        if (yield* hasReceipt(command.commandId)) return yield* commit;
+        const { thread } = yield* orchestrator.getThreadRecords(inheritedFrom, []);
+        if (thread.worktreePath != null) {
+          return yield* protection.withReference(
+            { projectId: thread.projectId, worktreePath: thread.worktreePath },
+            commit,
+          );
+        }
+      }
+      return yield* commit;
+    },
+    (effect, command) => {
+      const bindingThreadId =
+        command.type === "thread.create"
+          ? command.threadId
+          : command.type === "thread.metadata.update" && command.worktreePath !== undefined
+            ? command.threadId
+            : command.type === "thread.fork"
+              ? command.sourceThreadId
+              : command.type === "thread.unarchive"
+                ? command.threadId
+                : command.type === "delegated_task.request" &&
+                    command.workspaceStrategy === undefined
+                  ? command.parentThreadId
+                  : undefined;
+      // Fork planning rereads its source. Keep that binding stable until the new reference commits.
+      const protectedCommit =
+        bindingThreadId === undefined ? effect : referenceChanges.withLock(bindingThreadId, effect);
+      return protectedCommit.pipe(
+        Effect.catchTags({
+          GitCommandError: (cause) =>
+            new Orchestrator.OrchestratorCommandRejectedError({
+              commandId: command.commandId,
+              commandType: command.type,
+              cause,
+            }),
+        }),
+      );
+    },
+  );
+
   const dispatch: ThreadManagementServiceShape["dispatch"] = (command) =>
     ensureCommandTranscripts(command).pipe(
       Effect.andThen(assertDispatchTargetEnabled(command)),
-      Effect.andThen(orchestrator.dispatch(command)),
+      Effect.andThen(commitCommand(command)),
     );
 
   const getProjectThread: ThreadManagementServiceShape["getProjectThread"] = (input) =>
@@ -1212,6 +1284,7 @@ export const layer: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
+  | WorktreeProtection.WorktreeProtection
 > = Layer.effect(ThreadManagementService, make).pipe(
   Layer.provide(layerLegacyV1ThreadImporterNoop),
   Layer.provide(ThreadCommandExecutor.layer),
@@ -1225,4 +1298,5 @@ export const layerWithLegacyImporter: Layer.Layer<
   | ProviderSessionManager.ProviderSessionManagerV2
   | ServerSettings.ServerSettingsService
   | CommandReceiptStore.CommandReceiptStoreV2
+  | WorktreeProtection.WorktreeProtection
 > = Layer.effect(ThreadManagementService, make).pipe(Layer.provide(ThreadCommandExecutor.layer));

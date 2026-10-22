@@ -44,6 +44,7 @@ import * as SqlClient from "effect/sql/SqlClient";
 import * as TestClock from "effect/testing/TestClock";
 
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectStore from "./ProjectStore.ts";
 import * as ProjectService from "../project/ProjectService.ts";
@@ -120,6 +121,7 @@ interface HarnessOptions {
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
+  readonly protect?: WorktreeProtection.WorktreeProtection["Service"]["protect"];
   readonly createWorktree?: GitWorkflow.GitWorkflowService["Service"]["createWorktree"];
   readonly fetchWorktreeBaseCommit?: GitWorkflow.GitWorkflowService["Service"]["fetchWorktreeBaseCommit"];
   readonly remoteExists?: GitWorkflow.GitWorkflowService["Service"]["remoteExists"];
@@ -144,6 +146,11 @@ function makeHarness(options: HarnessOptions = {}) {
   const layerServerSettings = ServerSettings.layerTest(options.serverSettings);
   const layerReceipts = CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase));
   const layerThreadManagement = ThreadManagement.layer.pipe(
+    Layer.provide(
+      Layer.mock(WorktreeProtection.WorktreeProtection)({
+        withReference: (_input, effect) => effect,
+      }),
+    ),
     Layer.provide(layerOrchestrator),
     Layer.provide(layerServerSettings),
     Layer.provide(layerReceipts),
@@ -156,6 +163,7 @@ function makeHarness(options: HarnessOptions = {}) {
           worktree: { path: "/repo-worktrees/feature", refName: input.newRefName, headSha: "abc" },
         } as never)),
   );
+  const protect = vi.fn(options.protect ?? (() => Effect.void));
   const renameBranch = vi.fn(
     options.renameBranch ?? ((input) => Effect.succeed({ branch: input.newBranch })),
   );
@@ -175,6 +183,10 @@ function makeHarness(options: HarnessOptions = {}) {
   );
   const layerExternalServices = Layer.mergeAll(
     WorktreeSetupTracker.layer,
+    Layer.mock(WorktreeProtection.WorktreeProtection)({
+      protect,
+      withLease: (_input, effect) => effect,
+    }),
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({ close: closeTerminal }),
     Layer.succeed(ProjectService.ProjectService, {
@@ -271,6 +283,7 @@ function makeHarness(options: HarnessOptions = {}) {
       layerExternalServices,
     ),
     createWorktree,
+    protect,
     removeWorktree,
     renameBranch,
     generateBranchName,
@@ -1744,6 +1757,49 @@ it.effect("keeps the temporary branch when branch generation fails", () =>
   }),
 );
 
+it.effect("protects an attached worktree before releasing provider work", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const allowProtection = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      protect: () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(allowProtection))),
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launch = yield* launches
+        .launch(
+          launchInput({
+            command: "command:launch:protect-existing",
+            thread: "thread:launch:protect-existing",
+            message: "Use this checkout",
+            workspace: {
+              type: "existing_worktree",
+              worktreePath: "/repo-worktrees/shared",
+              branch: "shared",
+            },
+          }),
+        )
+        .pipe(Effect.forkChild);
+      yield* Deferred.await(entered);
+      const pending = yield* threads.getThreadProjection(
+        ThreadId.make("thread:launch:protect-existing"),
+      );
+      assert.notEqual(pending.runs[0]?.status, "starting");
+      yield* Deferred.succeed(allowProtection, undefined);
+      const launched = yield* Fiber.join(launch);
+      const ready = yield* preparationSettled(launched.threadId);
+      assert.equal(ready.thread.worktreePath, "/repo-worktrees/shared");
+      assert.equal(ready.runs[0]?.status, "starting");
+      assert.deepEqual(harness.protect.mock.calls[0]?.[0], {
+        cwd: project.workspaceRoot,
+        path: "/repo-worktrees/shared",
+      });
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
 it.effect("renames a temporary branch on an existing worktree to a generated name", () =>
   Effect.gen(function* () {
     const harness = makeHarness();
@@ -2889,8 +2945,10 @@ it.effect("shared intake preserves durable attachment bytes after a lost launch 
     );
     assert.isDefined(stored);
     assert.notEqual(stored.attachments[0]?.id, attachment.id);
+    const storedContext = stored.context?.records[0];
+    assert.ok(storedContext?.kind === "file");
     assert.equal(
-      (stored.context?.records[0] as { attachmentId: string }).attachmentId,
+      storedContext && "attachmentId" in storedContext ? storedContext.attachmentId : undefined,
       stored.attachments[0]?.id,
     );
     const userItem = accepted.turnItems.find(
@@ -3074,6 +3132,45 @@ it.effect("cancels tracked setup before provider work is released", () =>
       assert.equal(projection.runs[0]?.status, "failed");
       assert.isNull(projection.thread.worktreePath);
       assert.isEmpty(yield* outbox.listByCommandId(CommandId.make(`${input.commandId}:release`)));
+    }).pipe(Effect.provide(harness.layer));
+  }),
+);
+
+it.effect("retains the recorded worktree when cancellation cleanup refuses a live reference", () =>
+  Effect.gen(function* () {
+    const entered = yield* Deferred.make<void>();
+    const harness = makeHarness({
+      runSetup: () => Deferred.succeed(entered, undefined).pipe(Effect.andThen(Effect.never)),
+      git: {
+        removeWorktree: ({ cwd }) =>
+          Effect.fail(
+            new GitCommandError({
+              operation: "WorktreeProtection.assertRemovable",
+              command: "git worktree remove",
+              cwd,
+              detail: "A thread still references this worktree.",
+            }),
+          ),
+      },
+    });
+    yield* Effect.gen(function* () {
+      const launches = yield* ThreadLaunch.ThreadLaunchService;
+      const tracker = yield* WorktreeSetupTracker.WorktreeSetupTracker;
+      const threads = yield* ThreadManagement.ThreadManagementService;
+      const launched = yield* launches.launch(
+        launchInput({
+          command: "launch:cancel-protected",
+          thread: "thread:cancel-protected",
+          message: "Start",
+          workspace: { type: "worktree", baseRef: "main" },
+        }),
+      );
+      yield* Deferred.await(entered);
+      assert.isTrue(yield* tracker.cancel(launched.threadId));
+      const projection = yield* threads.getThreadProjection(launched.threadId);
+      assert.equal(projection.thread.worktreePath, "/repo-worktrees/feature");
+      assert.isNotNull(projection.thread.branch);
+      assert.equal(projection.runs[0]?.status, "failed");
     }).pipe(Effect.provide(harness.layer));
   }),
 );

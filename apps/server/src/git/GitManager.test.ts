@@ -1,3 +1,4 @@
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import { SourceControlProviderKind } from "@t3tools/contracts";
 // @effect-diagnostics nodeBuiltinImport:off
 import * as NodeFS from "node:fs";
@@ -923,6 +924,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
       let remoteReads = 0;
       const workflowContext = yield* Layer.build(
         GitWorkflowService.layer.pipe(
+          Layer.provide(WorktreeProtectionTestkit.layer),
           Layer.provide(
             Layer.succeed(GitManager.GitManager, {
               ...manager,
@@ -6367,6 +6369,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         const events: string[] = [];
         const workflows = yield* Effect.forEach([0, 1], () =>
           GitWorkflowService.make.pipe(
+            Effect.provide(WorktreeProtectionTestkit.layer),
             // Cache the real filesystem result so startImmediately reaches lease acquisition.
             Effect.provideService(FileSystem.FileSystem, {
               ...fileSystem,

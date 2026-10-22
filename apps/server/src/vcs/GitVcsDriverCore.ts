@@ -43,6 +43,7 @@ import * as GitVcsDriver from "./GitVcsDriver.ts";
 import { removeEmptyDirectory } from "./removeEmptyDirectory.ts";
 import { explicitBareRepositoryEnv, gitConfigEnv } from "./VcsProcess.ts";
 import { resolveWorktreesDirectory } from "../worktreesDirectory.ts";
+import { WORKTREE_PROTECTION_REASON } from "../workspace/worktreeProtectionReason.ts";
 import {
   parseRemoteNames,
   parseRemoteNamesInGitOrder,
@@ -482,7 +483,7 @@ function classifyGitFailure(stderr: string): GitCommandFailureReason | null {
     .filter(
       (line) =>
         GIT_DIAGNOSTIC_LINE_PATTERN.test(line) ||
-        (!/^remote:/.test(line) && SSH_TRANSPORT_REFUSAL_PATTERN.test(line)),
+        (!line.startsWith("remote:") && SSH_TRANSPORT_REFUSAL_PATTERN.test(line)),
     )
     .join("\n");
   if (diagnostics.length === 0) return null;
@@ -3710,9 +3711,34 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       }
       worktreePath = path.join(parentDir, repoName, sanitizedBranch);
     }
-    const args = input.newRefName
-      ? ["worktree", "add", "-b", input.newRefName, "--", worktreePath, input.refName]
-      : ["worktree", "add", "--", worktreePath, input.refName];
+    worktreePath = path.resolve(input.cwd, worktreePath);
+    const checkoutExists = yield* fileSystem.exists(worktreePath).pipe(
+      Effect.mapError(
+        (cause) =>
+          new GitCommandError({
+            operation: "GitVcsDriver.createWorktree",
+            command: "fs.exists",
+            cwd: input.cwd,
+            detail: "Could not inspect the worktree checkout.",
+            cause,
+          }),
+      ),
+    );
+    // Git retains locked registrations when a checkout disappears; ordinary pruning cannot recover it.
+    if (!checkoutExists && (yield* ownsWorktreeProtection(input.cwd, worktreePath))) {
+      yield* removeWorktree({ cwd: input.cwd, path: worktreePath });
+    }
+    const args = [
+      "worktree",
+      "add",
+      "--lock",
+      "--reason",
+      WORKTREE_PROTECTION_REASON,
+      ...(input.newRefName ? ["-b", input.newRefName] : []),
+      "--",
+      worktreePath,
+      input.refName,
+    ];
     const progress = options?.progress;
     const onCheckoutProgress = progress?.onCheckoutProgress;
 
@@ -4169,6 +4195,46 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
     return empty && (yield* removeEmptyDirectory(target));
   });
 
+  const ownsWorktreeProtection = Effect.fn("GitVcsDriver.ownsWorktreeProtection")(function* (
+    cwd: string,
+    target: string,
+  ) {
+    const listing = yield* executeWorktreeList("GitVcsDriver.ownsWorktreeProtection", cwd, []);
+    const protectedPaths = listing.stdout.split("\0\0").flatMap((record) => {
+      const fields = record.split("\0");
+      const worktree = fields.find((field) => field.startsWith("worktree "));
+      return worktree && fields.includes(`locked ${WORKTREE_PROTECTION_REASON}`)
+        ? [worktree.slice("worktree ".length)]
+        : [];
+    });
+    if (protectedPaths.length === 0) return false;
+    const canonicalPath = Effect.fnUntraced(function* (value: string) {
+      let ancestor = path.resolve(value);
+      const suffix: string[] = [];
+      while (true) {
+        const resolved = yield* fileSystem.realPath(ancestor).pipe(Effect.result);
+        if (Result.isSuccess(resolved)) return path.join(resolved.success, ...suffix);
+        const parent = path.dirname(ancestor);
+        if (resolved.failure.reason._tag !== "NotFound" || parent === ancestor) {
+          return yield* new GitCommandError({
+            operation: "GitVcsDriver.ownsWorktreeProtection",
+            command: "fs.realPath",
+            cwd,
+            detail: "Could not resolve the protected worktree path.",
+            cause: resolved.failure,
+          });
+        }
+        suffix.unshift(path.basename(ancestor));
+        ancestor = parent;
+      }
+    });
+    const realTarget = yield* canonicalPath(target);
+    for (const worktreePath of protectedPaths) {
+      if ((yield* canonicalPath(worktreePath)) === realTarget) return true;
+    }
+    return false;
+  });
+
   const removeWorktree: GitVcsDriver.GitVcsDriver["Service"]["removeWorktree"] = Effect.fn(
     "removeWorktree",
   )(function* (input) {
@@ -4183,14 +4249,39 @@ export const makeGitVcsDriverCore = Effect.fn("makeGitVcsDriverCore")(function* 
       args.push("--force");
     }
     args.push("--", target);
-    const result = yield* executeGitWithStableDiagnostics(
-      "GitVcsDriver.removeWorktree",
-      input.cwd,
-      args,
-      {
-        timeoutMs: WORKTREE_REMOVE_TIMEOUT_MS,
-        allowNonZeroExit: true,
-      },
+    const ownedProtection = yield* ownsWorktreeProtection(input.cwd, target);
+    const result = yield* Effect.acquireUseRelease(
+      ownedProtection
+        ? runGit("GitVcsDriver.removeWorktree.unlock", input.cwd, [
+            "worktree",
+            "unlock",
+            "--",
+            target,
+          ]).pipe(Effect.as(true))
+        : Effect.succeed(false),
+      () =>
+        executeGitWithStableDiagnostics("GitVcsDriver.removeWorktree", input.cwd, args, {
+          timeoutMs: WORKTREE_REMOVE_TIMEOUT_MS,
+          allowNonZeroExit: true,
+        }),
+      (unlocked, exit) =>
+        unlocked && (Exit.isFailure(exit) || exit.value.exitCode !== 0)
+          ? fileSystem.exists(target).pipe(
+              Effect.flatMap((exists) =>
+                exists
+                  ? runGit("GitVcsDriver.removeWorktree.relock", input.cwd, [
+                      "worktree",
+                      "lock",
+                      "--reason",
+                      WORKTREE_PROTECTION_REASON,
+                      "--",
+                      target,
+                    ])
+                  : Effect.void,
+              ),
+              Effect.orDie,
+            )
+          : Effect.void,
     );
     if (result.exitCode === 0) {
       // Git for Windows never descends into NTFS junctions, such as pnpm's

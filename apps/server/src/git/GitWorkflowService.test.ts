@@ -4,11 +4,14 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 
-import { VcsRepositoryDetectionError } from "@t3tools/contracts";
+import { GitCommandError, VcsRepositoryDetectionError } from "@t3tools/contracts";
 
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as FileSystem from "effect/FileSystem";
 
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
+import * as VcsDriver from "../vcs/VcsDriver.ts";
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import * as ServerConfig from "../config.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as GitManager from "./GitManager.ts";
@@ -20,6 +23,7 @@ function layer(input: {
   readonly detect: VcsDriverRegistry.VcsDriverRegistry["Service"]["detect"];
 }) {
   return GitWorkflowService.layer.pipe(
+    Layer.provide(WorktreeProtectionTestkit.layer),
     Layer.provide(
       Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
         detect: input.detect,
@@ -31,6 +35,110 @@ function layer(input: {
 }
 
 it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
+  it.effect.each([true, false])("guards worktree removal with active reference %s", (active) =>
+    Effect.gen(function* () {
+      let leased = false;
+      const events: string[] = [];
+      const removed = vi.fn();
+      const resolved = vi.fn();
+      const location = { cwd: "/repo", path: "/worktrees/repo/shared", force: true };
+      const driver = yield* VcsDriver.VcsDriver;
+      const protectionLayer = Layer.mock(WorktreeProtection.WorktreeProtection)({
+        withLease: (_input, effect) =>
+          Effect.gen(function* () {
+            leased = true;
+            events.push("lease");
+            return yield* effect.pipe(
+              Effect.ensuring(
+                Effect.sync(() => {
+                  leased = false;
+                  events.push("release");
+                }),
+              ),
+            );
+          }),
+        assertRemovable: () =>
+          Effect.gen(function* () {
+            assert.isTrue(leased);
+            events.push("guard");
+            if (active)
+              return yield* new GitCommandError({
+                operation: "WorktreeProtection.assertRemovable",
+                cwd: location.cwd,
+                command: "git worktree remove",
+                detail: "A resumable thread references the checkout.",
+              });
+          }),
+      });
+      const workflowLayer = GitWorkflowService.layer.pipe(
+        Layer.provide(protectionLayer),
+        Layer.provide(
+          Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
+            resolve: () =>
+              Effect.sync(() => {
+                resolved();
+                assert.isTrue(leased);
+                events.push("resolve");
+                return {
+                  kind: "git",
+                  driver,
+                  repository: {
+                    kind: "git",
+                    rootPath: location.cwd,
+                    metadataPath: "/repo/.git",
+                    freshness: {
+                      source: "live-local",
+                      observedAt: DateTime.makeUnsafe("2026-01-01T00:00:00.000Z"),
+                      expiresAt: Option.none(),
+                    },
+                  },
+                } satisfies VcsDriverRegistry.VcsDriverHandle;
+              }),
+          }),
+        ),
+        Layer.provide(
+          Layer.mock(GitVcsDriver.GitVcsDriver)({
+            removeWorktree: () =>
+              Effect.sync(() => {
+                assert.isTrue(leased);
+                events.push("remove");
+                removed();
+              }),
+          }),
+        ),
+        Layer.provide(Layer.mock(GitManager.GitManager)({})),
+      );
+      yield* Effect.gen(function* () {
+        const workflow = yield* GitWorkflowService.GitWorkflowService;
+        if (active) {
+          const error = yield* workflow.removeWorktree(location).pipe(Effect.flip);
+          assert.equal(error._tag, "GitCommandError");
+          expect(resolved).not.toHaveBeenCalled();
+          expect(removed).not.toHaveBeenCalled();
+          assert.deepEqual(events, ["lease", "guard", "release"]);
+        } else {
+          yield* workflow.removeWorktree(location);
+          expect(removed).toHaveBeenCalledOnce();
+          assert.deepEqual(events, ["lease", "guard", "resolve", "remove", "release"]);
+        }
+        assert.isFalse(leased);
+      }).pipe(Effect.provide(workflowLayer));
+    }).pipe(
+      Effect.provide(
+        Layer.mock(VcsDriver.VcsDriver)({
+          capabilities: {
+            kind: "git",
+            supportsWorktrees: true,
+            supportsBookmarks: false,
+            supportsAtomicSnapshot: false,
+            supportsPushDefaultRemote: true,
+            ignoreClassifier: "git-compatible-fallback",
+          },
+        }),
+      ),
+    ),
+  );
+
   it.effect("reports a non-Git VCS repository as not a Git repository", () =>
     Effect.gen(function* () {
       const workflow = yield* GitWorkflowService.GitWorkflowService;
@@ -123,6 +231,7 @@ it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
     const status = vi.fn();
 
     const layerTest = GitWorkflowService.layer.pipe(
+      Layer.provide(WorktreeProtectionTestkit.layer),
       Layer.provide(
         Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
           detect: () => Effect.succeed(null),
@@ -250,6 +359,7 @@ it.layer(NodeServices.layer)("GitWorkflowService", (it) => {
       Effect.scoped,
       Effect.provide(
         GitWorkflowService.layer.pipe(
+          Layer.provide(WorktreeProtectionTestkit.layer),
           Layer.provide(
             Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({
               resolve: () => Effect.succeed({ kind: "git" } as VcsDriverRegistry.VcsDriverHandle),

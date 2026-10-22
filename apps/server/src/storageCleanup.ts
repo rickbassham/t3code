@@ -11,6 +11,7 @@ import type {
   ServerSettings,
   ServerSettingsError,
   TerminalSummary,
+  ThreadId,
   WorktreeCleanupRules,
   StorageCleanupReport,
   StorageCleanupReportEntry,
@@ -45,7 +46,7 @@ import * as Settings from "./serverSettings.ts";
 import * as TerminalManager from "./terminal/Manager.ts";
 import { isFilesystemRoot, managedWorktreesDirectories } from "./worktreesDirectory.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
-import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
+import * as WorktreeProtection from "./workspace/WorktreeProtection.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 
@@ -207,6 +208,7 @@ const make = Effect.gen(function* () {
   const sql = yield* SqlClient.SqlClient;
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
+  const protection = yield* WorktreeProtection.WorktreeProtection;
   const terminals = yield* TerminalManager.TerminalManager;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
@@ -742,6 +744,8 @@ const make = Effect.gen(function* () {
       const keep = (reason: string) => entries.push({ ...entry, reason: sentence(reason) });
       yield* Effect.gen(function* () {
         if (!(yield* fs.exists(worktreePath))) return;
+        if (group.some((member) => member.archivedAt === null && member.deletedAt === null))
+          return keep("referenced by a resumable thread");
         if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
         if (group.length > 1 && worktreeOwner(group) === undefined)
           return keep(`shared by ${group.length} threads`);
@@ -889,6 +893,12 @@ const make = Effect.gen(function* () {
           const latest = (yield* projections.getThreadWorktreePaths({
             includeArchived: true,
           })).filter((entry) => path.resolve(entry.worktreePath) === worktreePath);
+          if (
+            (yield* projections.getThreadWorktreePaths()).some(
+              (entry) => path.resolve(entry.worktreePath) === worktreePath,
+            )
+          )
+            return "referenced by a resumable thread";
           if (hasTerminal(worktreePath)) return "open terminal";
           if (deleted) {
             if (
@@ -975,6 +985,7 @@ const make = Effect.gen(function* () {
           )
         )
           return keep("settings changed since check");
+        yield* protection.assertRemovable({ cwd: project.workspaceRoot, path: worktreePath });
         // Clean only untracked files. Ordinary worktrees retain Git's final tracked-edit check.
         if (settings.worktreeKeepWhen === "tracked-changes")
           yield* cleanupGit(worktreePath, ["clean", "-ffdx"], "git clean");
@@ -984,27 +995,21 @@ const make = Effect.gen(function* () {
           const changes = yield* localChangesReason(worktreePath, settings);
           if (changes !== null) return keep(changes);
         }
-        yield* cleanupGit(
-          project.workspaceRoot,
-          [
-            "-c",
-            "status.showUntrackedFiles=normal",
-            "worktree",
-            "remove",
-            // Git requires force for submodules; recursive checks above cannot make removal atomic.
-            ...(submodules.force ? ["--force"] : []),
-            "--",
-            worktreePath,
-          ],
-          "git worktree remove",
-        );
+        yield* git.removeWorktree({
+          cwd: project.workspaceRoot,
+          path: worktreePath,
+          force: submodules.force,
+        });
         entries.push({ ...entry, outcome: "removed", reason: sentence(removalReason), bytes });
         yield* gitManager.invalidateStatus(project.workspaceRoot);
-        // Preserve branch and path: ProviderTurnStartService recreates the checkout
-        // from that branch when the thread is resumed.
+        // Retired threads retain history and their branch even after checkout cleanup.
         yield* Effect.logInfo("storage cleanup removed worktree", { threadId: thread.id });
       }).pipe(
-        (effect) => withWorkspaceLease(worktreePath, effect),
+        (effect) =>
+          protection.withLease(
+            { cwd: project?.workspaceRoot ?? worktreePath, path: worktreePath },
+            effect,
+          ),
         Effect.catch((error) =>
           Effect.gen(function* () {
             entries.push({
@@ -1165,8 +1170,28 @@ const make = Effect.gen(function* () {
   });
   const automaticSweepQueued = yield* Ref.make(false);
   const worker = yield* makeDrainableWorker(
-    (completion: Deferred.Deferred<StorageCleanupReport, ServerSettingsError> | undefined) =>
-      (completion === undefined ? Ref.set(automaticSweepQueued, false) : Effect.void).pipe(
+    (
+      completion:
+        | Deferred.Deferred<StorageCleanupReport, ServerSettingsError>
+        | undefined
+        | { threadId: ThreadId }
+        | "protect-all",
+    ) => {
+      if (completion === "protect-all")
+        return protection.reconcileAll.pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("worktree protection reconciliation failed", { error }),
+          ),
+        );
+      if (completion !== undefined && "threadId" in completion)
+        return protection
+          .reconcileThread(completion.threadId)
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("thread worktree protection reconciliation failed", { error }),
+            ),
+          );
+      return (completion === undefined ? Ref.set(automaticSweepQueued, false) : Effect.void).pipe(
         Effect.andThen(sweep(completion === undefined ? "automatic" : "manual")),
         Effect.exit,
         Effect.flatMap((exit) =>
@@ -1179,7 +1204,8 @@ const make = Effect.gen(function* () {
               )
             : Deferred.done(completion, exit).pipe(Effect.asVoid),
         ),
-      ),
+      );
+    },
   );
   const requestSweep = Ref.getAndSet(automaticSweepQueued, true).pipe(
     Effect.flatMap((queued) => (queued ? Effect.void : worker.enqueue(undefined))),
@@ -1210,11 +1236,14 @@ const make = Effect.gen(function* () {
     const events = engine.streamDomainEvents;
     let lastSettings = yield* settingsService.getSettings.pipe(Effect.orDie);
     yield* forkParked(
-      requestSweep.pipe(
-        Effect.andThen(worker.drain),
-        Effect.repeat(Schedule.spaced("1 hour")),
-        Effect.asVoid,
-      ),
+      worker
+        .enqueue("protect-all")
+        .pipe(
+          Effect.andThen(requestSweep),
+          Effect.andThen(worker.drain),
+          Effect.repeat(Schedule.spaced("1 hour")),
+          Effect.asVoid,
+        ),
     );
     yield* forkParked(
       Stream.runForEach(changes, (settings) => {
@@ -1229,14 +1258,26 @@ const make = Effect.gen(function* () {
       }),
     );
     yield* forkParked(
-      Stream.runForEach(events, (event) =>
-        (event.type === "thread.deleted" ||
-          (event.type === "provider-session.updated" &&
-            (event.payload.status === "stopped" || event.payload.status === "error"))) &&
-        anyWorktreePolicy(lastSettings, (rules) => rules.worktreeOnDelete)
-          ? requestSweep
-          : Effect.void,
-      ).pipe(
+      Stream.runForEach(events, (event) => {
+        const reconcile =
+          event.type === "thread.created" ||
+          event.type === "thread.archived" ||
+          event.type === "thread.unarchived" ||
+          event.type === "thread.deleted" ||
+          event.type === "thread.metadata-updated"
+            ? worker.enqueue({ threadId: event.threadId })
+            : Effect.void;
+        return reconcile.pipe(
+          Effect.andThen(
+            (event.type === "thread.deleted" ||
+              (event.type === "provider-session.updated" &&
+                (event.payload.status === "stopped" || event.payload.status === "error"))) &&
+              anyWorktreePolicy(lastSettings, (rules) => rules.worktreeOnDelete)
+              ? requestSweep
+              : Effect.void,
+          ),
+        );
+      }).pipe(
         Effect.catchCause((cause) =>
           Effect.logWarning("Storage cleanup event stream failed", { cause }),
         ),
@@ -1252,4 +1293,6 @@ const make = Effect.gen(function* () {
   });
 });
 
-export const layer = Layer.effect(StorageCleanup, make);
+export const layer = Layer.effect(StorageCleanup, make).pipe(
+  Layer.provide(WorktreeProtection.layer),
+);

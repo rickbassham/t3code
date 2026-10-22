@@ -453,6 +453,8 @@ export interface ProjectionStoreV2Shape {
   ) => Effect.Effect<ReadonlyArray<ProjectionThreadPullRequests>, ProjectionStoreV2Error>;
   readonly getThreadWorktreePaths: (options?: {
     readonly includeArchived?: boolean;
+    readonly includeDeleted?: boolean;
+    readonly includeBusyRetired?: boolean;
   }) => Effect.Effect<
     ReadonlyArray<{ readonly threadId: ThreadId; readonly worktreePath: string }>,
     ProjectionStoreV2Error
@@ -6091,9 +6093,41 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       sql<{ readonly thread_id: string; readonly worktree_path: string }>`
         SELECT thread_id, json_extract(payload_json, '$.worktreePath') AS worktree_path
         FROM orchestration_v2_projection_threads
-        WHERE deleted_at IS NULL
-          ${options?.includeArchived === true ? sql`` : sql`AND json_extract(payload_json, '$.archivedAt') IS NULL`}
-          AND json_extract(payload_json, '$.worktreePath') IS NOT NULL
+        WHERE (
+          (${options?.includeDeleted === true ? sql`TRUE` : sql`deleted_at IS NULL`}
+           ${options?.includeArchived === true ? sql`` : sql`AND json_extract(payload_json, '$.archivedAt') IS NULL`})
+          ${
+            options?.includeBusyRetired === true
+              ? sql`
+            OR EXISTS (
+              SELECT 1 FROM orchestration_v2_projection_runs AS worktree_run
+              WHERE worktree_run.thread_id = orchestration_v2_projection_threads.thread_id
+                AND worktree_run.status NOT IN ('completed','failed','cancelled','interrupted','rolled_back')
+            )
+            OR EXISTS (
+              SELECT 1 FROM orchestration_v2_effect_outbox AS worktree_effect
+              WHERE worktree_effect.thread_id = orchestration_v2_projection_threads.thread_id
+                AND worktree_effect.status NOT IN ('succeeded','cancelled')
+            )
+          `
+              : sql``
+          }
+        ) AND json_extract(payload_json, '$.worktreePath') IS NOT NULL
+        ${
+          options?.includeBusyRetired === true
+            ? sql`
+          UNION
+          SELECT worktree_effect.thread_id,
+            json_extract(worktree_session.payload_json, '$.cwd') AS worktree_path
+          FROM orchestration_v2_effect_outbox AS worktree_effect
+          JOIN orchestration_v2_projection_provider_sessions AS worktree_session
+            ON worktree_session.provider_session_id = json_extract(worktree_effect.payload_json, '$.providerSessionId')
+          WHERE worktree_effect.effect_type = 'provider-session.detach'
+            AND worktree_effect.status NOT IN ('succeeded','cancelled')
+            AND json_extract(worktree_session.payload_json, '$.cwd') IS NOT NULL
+        `
+            : sql``
+        }
       `.pipe(
         Effect.map((rows) =>
           rows.map((row) => ({
@@ -6620,9 +6654,16 @@ export const layerMemory: Layer.Layer<ProjectionStoreV2> = Layer.effect(
       getThreadWorktreePaths: (options) =>
         Ref.get(replayState).pipe(
           Effect.map((state) =>
-            [...state.projections.values()].flatMap(({ thread }) =>
-              thread.deletedAt === null &&
-              (options?.includeArchived === true || thread.archivedAt === null) &&
+            [...state.projections.values()].flatMap(({ thread, runs }) =>
+              (((options?.includeDeleted === true || thread.deletedAt === null) &&
+                (options?.includeArchived === true || thread.archivedAt === null)) ||
+                (options?.includeBusyRetired === true &&
+                  runs.some(
+                    (run) =>
+                      !["completed", "failed", "cancelled", "interrupted", "rolled_back"].includes(
+                        run.status,
+                      ),
+                  ))) &&
               thread.worktreePath !== null
                 ? [{ threadId: thread.id, worktreePath: thread.worktreePath }]
                 : [],

@@ -186,10 +186,16 @@ Inherit follows each machine's rules; Off keeps that project's worktrees until y
 manually. Custom applies separate worktree rules to the selected project or checkout. Browser
 captures and log retention remain machine-wide.
 
-Worktrees can be removed after a chosen number of inactive days, after a thread settles, after
-merging, or when they have no commits beyond the default branch. Set settled retention to 0 days
-to remove a worktree at the next cleanup after settlement. Only T3-managed worktrees are eligible.
-Active sessions and shared worktrees prevent removal. **Keep worktrees with local changes** defaults
+T3 protects managed worktrees while any unarchived thread references them. Settling a thread,
+completing its work, or pausing its goal keeps that protection. Archive, delete, or move every
+referencing thread before removing the worktree. Ordinary `git worktree remove` also respects
+this protection; existing manual Git locks remain yours to release.
+
+After all referencing threads are archived or deleted, worktrees can be removed after a chosen
+number of inactive days, after settlement or merging, or when they have no commits beyond the
+default branch. Set settled retention to 0 days to remove an eligible worktree at the next cleanup.
+Only T3-managed worktrees are eligible. Active sessions and shared worktrees prevent removal.
+**Keep worktrees with local changes** defaults
 to **Uncommitted changes**, which protects tracked edits and untracked files but deletes ignored
 files such as `.env` and build output. **Any local files** also protects ignored files other than
 `node_modules`. **Edited tracked files** protects only tracked edits and allows untracked and

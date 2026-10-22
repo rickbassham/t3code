@@ -1,3 +1,4 @@
+import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import { assert, it } from "@effect/vitest";
 import {
   CommandId,
@@ -181,10 +182,12 @@ it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
       assert.equal(shell?.title, "Before");
     }).pipe(
       Effect.provide(
-        ThreadManagement.layer.pipe(
-          Layer.provide(ServerSettings.layerTest()),
-          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-        ),
+        ThreadManagement.layer
+          .pipe(Layer.provide(WorktreeProtectionTestkit.layer))
+          .pipe(
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+          ),
       ),
     ),
   );
@@ -199,10 +202,12 @@ it.layer(layerOrchestrator)("writesThreads against a mode raise", (it) => {
       assert.equal((yield* projections.getThreadShell(threadId))?.title, "Renamed by the agent");
     }).pipe(
       Effect.provide(
-        ThreadManagement.layer.pipe(
-          Layer.provide(ServerSettings.layerTest()),
-          Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
-        ),
+        ThreadManagement.layer
+          .pipe(Layer.provide(WorktreeProtectionTestkit.layer))
+          .pipe(
+            Layer.provide(ServerSettings.layerTest()),
+            Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
+          ),
       ),
     ),
   );

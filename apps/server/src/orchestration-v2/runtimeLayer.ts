@@ -1,3 +1,5 @@
+import * as VcsProcess from "../vcs/VcsProcess.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
 import * as Scheduler from "../scheduling/Scheduler.ts";
 import * as Layer from "effect/Layer";
@@ -58,6 +60,11 @@ import * as SecretRequests from "../secrets/SecretRequests.ts";
 export const layerEventInfrastructure = Layer.mergeAll(
   OrchestrationEventStore.layer,
   OrchestrationCommandReceipts.layer,
+);
+
+const layerWorktreeProtection = WorktreeProtection.layer.pipe(
+  Layer.provide(Layer.merge(ProjectionStore.layer, ProjectStore.layer)),
+  Layer.provide(GitVcsDriver.layer.pipe(Layer.provide(VcsProcess.layer))),
 );
 
 const layerRuntimePolicyProvided = RuntimePolicy.layerFromProjectStore.pipe(
@@ -162,6 +169,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 );
 
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+  Layer.provide(layerWorktreeProtection),
   Layer.provide(
     Layer.mergeAll(
       layerContextHandoffServiceProvided,
@@ -249,6 +257,7 @@ const layerAgentSessionImporterProvided = AgentSessionImporter.layer.pipe(
 );
 
 const layerThreadManagementProvided = ThreadManagementService.layerWithLegacyImporter.pipe(
+  Layer.provide(layerWorktreeProtection),
   Layer.provide(
     Layer.mergeAll(
       layerOrchestratorProvided,
@@ -265,6 +274,7 @@ const layerManagedProjectFoldersProvided = ManagedProjectFolders.layer.pipe(
   Layer.provide(layerProjectService),
 );
 const layerThreadLaunchProvided = ThreadLaunchService.layer.pipe(
+  Layer.provide(layerWorktreeProtection),
   Layer.provide(
     Layer.mergeAll(
       layerProjectService,
