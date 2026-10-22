@@ -908,7 +908,6 @@ describe("getChangeRequest commits", () => {
     editedAtById: new Map<string, string>(),
     reviewers: [],
     avatarsByLogin: new Map<string, string>(),
-    botLogins: new Set<string>(),
     commitStats: new Map<string, { readonly additions: number; readonly deletions: number }>(),
     viewer: { canUpdate: true, didAuthor: false },
   };
@@ -976,7 +975,7 @@ describe("getChangeRequestActivity dismissed reviews", () => {
   const dismissedReview = (body: string) => ({
     id: "PRR_1",
     kind: "review" as const,
-    author: { login: "macroscopeapp", name: null, avatarUrl: null },
+    author: { login: "macroscopeapp[bot]", name: null, avatarUrl: null, isBot: true },
     body,
     createdAt: "2026-07-03T00:00:00Z",
     url: null,
@@ -995,7 +994,6 @@ describe("getChangeRequestActivity dismissed reviews", () => {
     editedAtById: new Map([["PRR_1", "2026-07-04T00:00:00Z"]]),
     reviewers: [],
     avatarsByLogin: new Map(),
-    botLogins: new Set(["macroscopeapp"]),
     commitStats: new Map(),
     commits: [],
     viewer: { canUpdate: true, didAuthor: false },
