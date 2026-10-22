@@ -458,8 +458,9 @@ const make = Effect.gen(function* () {
       }
 
       if (worktreePath !== null) {
+        const location = { cwd: project.workspaceRoot, path: worktreePath };
         yield* protection
-          .protect({ cwd: project.workspaceRoot, path: worktreePath })
+          .withLease(location, protection.protect(location))
           .pipe(Effect.mapError(mapError(input, "provision-worktree", threadId)));
       }
       // Rewriting a reused worktree could undo the first attempt's branch rename.

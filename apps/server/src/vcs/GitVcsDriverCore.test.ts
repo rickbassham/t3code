@@ -4229,6 +4229,88 @@ it.layer(layerTest)("GitVcsDriver core integration", (it) => {
       }),
     );
 
+    it.effect.each(["manual-lock", "git-failure", "interrupted"])(
+      "restores failed removal safely after %s",
+      (restoration) =>
+        Effect.gen(function* () {
+          const cwd = yield* makeTmpDir();
+          const { initialBranch } = yield* initRepoWithCommit(cwd);
+          const path = yield* Path.Path;
+          const original = yield* GitVcsDriver.GitVcsDriver;
+          const delegate = yield* ChildProcessSpawner.ChildProcessSpawner;
+          const started = yield* Deferred.make<void>();
+          const wait = yield* Deferred.make<void>();
+          const worktreePath = path.join(yield* makeTmpDir("git-worktrees-"), restoration);
+          yield* original.createWorktree({
+            cwd,
+            path: worktreePath,
+            refName: initialBranch,
+            newRefName: `feature/${restoration}`,
+          });
+          yield* writeTextFile(worktreePath, "draft.txt", "unsaved work\n");
+          let removing = false;
+          const spawner = ChildProcessSpawner.make((command) =>
+            Effect.gen(function* () {
+              if (ChildProcess.isStandardCommand(command)) {
+                if (command.args.includes("remove")) {
+                  removing = true;
+                  if (restoration === "manual-lock")
+                    yield* original
+                      .execute({
+                        operation: "GitVcsDriver.test.concurrent-lock",
+                        cwd,
+                        args: ["worktree", "lock", "--reason", "Owner took over", worktreePath],
+                      })
+                      .pipe(Effect.orDie);
+                  if (restoration === "interrupted") {
+                    yield* Deferred.succeed(started, undefined);
+                    yield* Deferred.await(wait);
+                  }
+                }
+                if (removing && restoration === "git-failure" && command.args[1] === "lock")
+                  return makeNonRepositoryHandle();
+              }
+              return yield* delegate.spawn(command);
+            }),
+          );
+          const driver = yield* makeGitVcsDriverCore().pipe(
+            Effect.provideService(ChildProcessSpawner.ChildProcessSpawner, spawner),
+            Effect.provide(layerServerConfig),
+          );
+          if (restoration === "interrupted") {
+            const fiber = yield* driver
+              .removeWorktree({ cwd, path: worktreePath })
+              .pipe(Effect.forkChild({ startImmediately: true }));
+            yield* Deferred.await(started);
+            yield* Fiber.interrupt(fiber);
+          } else {
+            const removal = yield* Effect.result(
+              driver.removeWorktree({ cwd, path: worktreePath }),
+            );
+            assert.isTrue(Result.isFailure(removal));
+            if (Result.isFailure(removal)) {
+              assert.equal(removal.failure._tag, "GitCommandError");
+              assert.equal(
+                removal.failure.operation,
+                restoration === "git-failure"
+                  ? "GitVcsDriver.removeWorktree.relock"
+                  : "GitVcsDriver.removeWorktree",
+              );
+            }
+          }
+          const fs = yield* FileSystem.FileSystem;
+          assert.equal(
+            yield* fs.readFileString(path.join(worktreePath, "draft.txt")),
+            "unsaved work\n",
+          );
+          if (restoration !== "git-failure")
+            assert.include(
+              yield* git(cwd, ["worktree", "list", "--porcelain"]),
+              `locked ${restoration === "manual-lock" ? "Owner took over" : WORKTREE_PROTECTION_REASON}`,
+            );
+        }),
+    );
+
     it.effect("preserves a manually locked worktree even for forced T3 removal", () =>
       Effect.gen(function* () {
         const cwd = yield* makeTmpDir();

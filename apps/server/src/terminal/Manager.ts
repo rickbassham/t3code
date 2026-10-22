@@ -1,7 +1,7 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- Effect's Crypto digest is effectful; a sync hash keeps historyPath a plain function.
 import * as NodeCrypto from "node:crypto";
 
-import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { canonicalWorkspacePath, withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   DEFAULT_TERMINAL_ID,
   DEFAULT_MAX_TERMINAL_BUFFER_BYTES,
@@ -2853,11 +2853,17 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
     return snapshot(liveSession);
   });
 
-  const openLocked = (input: TerminalOpenInput) =>
-    withWorkspaceLease(
-      path.resolve(input.worktreePath ?? input.cwd),
-      openWithWorkspaceLease(input),
+  const withTerminalWorkspaceLease = <A, E, R>(
+    input: Pick<TerminalOpenInput, "worktreePath" | "cwd">,
+    effect: Effect.Effect<A, E, R>,
+  ) =>
+    canonicalWorkspacePath(fileSystem, path, path.resolve(input.worktreePath ?? input.cwd)).pipe(
+      Effect.mapError((cause) => new TerminalCwdStatError({ cwd: input.cwd, cause })),
+      Effect.flatMap((target) => withWorkspaceLease(target, effect)),
     );
+
+  const openLocked = (input: TerminalOpenInput) =>
+    withTerminalWorkspaceLease(input, openWithWorkspaceLease(input));
 
   const open: TerminalManager["Service"]["open"] = (input) =>
     withThreadLock(
@@ -3296,10 +3302,7 @@ export const makeWithOptions = Effect.fn("TerminalManager.makeWithOptions")(func
       input.threadId,
       resolveLaunchInputEnvironment(input).pipe(
         Effect.flatMap((resolved) =>
-          withWorkspaceLease(
-            path.resolve(resolved.worktreePath ?? resolved.cwd),
-            restartResolved(resolved),
-          ),
+          withTerminalWorkspaceLease(resolved, restartResolved(resolved)),
         ),
       ),
     );

@@ -39,6 +39,7 @@ import * as TestClock from "effect/testing/TestClock";
 import { ChildProcessSpawner } from "effect/process";
 import { expect, vi } from "vite-plus/test";
 
+import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as ServerSecretStore from "../auth/ServerSecretStore.ts";
 import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
@@ -493,6 +494,57 @@ it.layer(
   Layer.merge(NodeServices.layer, ProcessRunner.layer.pipe(Layer.provide(NodeServices.layer))),
   { excludeTestServices: true },
 )("TerminalManager", (it) => {
+  it.effect("waits for the canonical workspace lease before opening a symlinked terminal", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const temporary = yield* fs.makeTempDirectoryScoped({ prefix: "terminal-lease-" });
+      const target = yield* fs.realPath(temporary);
+      const alias = path.join(temporary, "alias");
+      yield* fs.symlink(target, alias);
+      const accessed = yield* Deferred.make<void>();
+      let checkedCwd = false;
+      const observedFs = {
+        ...fs,
+        realPath: (location: string) =>
+          fs
+            .realPath(location)
+            .pipe(
+              Effect.tap(() =>
+                location === alias ? Deferred.succeed(accessed, undefined) : Effect.void,
+              ),
+            ),
+        stat: (location: string) =>
+          Effect.gen(function* () {
+            if (location === alias) {
+              checkedCwd = true;
+              yield* Deferred.succeed(accessed, undefined);
+            }
+            return yield* fs.stat(location);
+          }),
+      };
+      const { manager, ptyAdapter } = yield* createManager().pipe(
+        Effect.provideService(FileSystem.FileSystem, observedFs),
+      );
+      const opening = yield* withWorkspaceLease(
+        target,
+        Effect.gen(function* () {
+          const fiber = yield* manager
+            .open({ ...openInput(), cwd: alias, worktreePath: alias })
+            .pipe(Effect.forkScoped);
+          yield* Deferred.await(accessed);
+          yield* Effect.yieldNow;
+          expect(checkedCwd).toBe(false);
+          expect(ptyAdapter.spawnInputs).toHaveLength(0);
+          return fiber;
+        }),
+      );
+      yield* Fiber.join(opening);
+      expect(checkedCwd).toBe(true);
+      expect(ptyAdapter.spawnInputs).toHaveLength(1);
+    }),
+  );
+
   it.effect("spawns lazily and reuses running terminal per thread", () =>
     Effect.gen(function* () {
       const { manager, ptyAdapter } = yield* createManager();
@@ -1758,7 +1810,7 @@ it.layer(
       expect(events.filter((event) => event.type === "output").map((event) => event.data)).toEqual(
         writes,
       );
-      const snapshot = events.filter((event) => event.type === "snapshot").at(-1)?.snapshot;
+      const snapshot = events.findLast((event) => event.type === "snapshot")?.snapshot;
       expect(snapshot?.history).toBe("aa😀\rEND");
       expect(snapshot?.sequence).toBe(reopened.sequence);
     }),

@@ -77,24 +77,37 @@ const fixture = Effect.gen(function* () {
     repositoryIdentity: null,
   };
   const failedLockPath = yield* Ref.make<string | null>(null);
+  const legacyList = yield* Ref.make(false);
   const service = yield* WorktreeProtection.make.pipe(
     Effect.provideService(GitVcsDriver.GitVcsDriver, {
       ...git,
       execute: (input) =>
-        Ref.get(failedLockPath).pipe(
-          Effect.flatMap((failed) =>
-            input.args[0] === "worktree" && input.args[1] === "lock" && input.args.at(-1) === failed
-              ? Effect.fail(
-                  new GitCommandError({
-                    operation: input.operation,
-                    cwd: input.cwd,
-                    command: "git worktree lock",
-                    detail: "Injected lock failure",
-                  }),
-                )
-              : git.execute(input),
-          ),
-        ),
+        Effect.gen(function* () {
+          if ((yield* Ref.get(legacyList)) && input.args.includes("-z")) {
+            const rejected = yield* git.execute({
+              ...input,
+              args: ["worktree", "list", "--invalid"],
+              allowNonZeroExit: true,
+            });
+            return { ...rejected, stderr: "error: unknown switch `z'\n" };
+          }
+          return yield* Ref.get(failedLockPath).pipe(
+            Effect.flatMap((failed) =>
+              input.args[0] === "worktree" &&
+              input.args[1] === "lock" &&
+              input.args.at(-1) === failed
+                ? Effect.fail(
+                    new GitCommandError({
+                      operation: input.operation,
+                      cwd: input.cwd,
+                      command: "git worktree lock",
+                      detail: "Injected lock failure",
+                    }),
+                  )
+                : git.execute(input),
+            ),
+          );
+        }),
     }),
     Effect.provide(
       Layer.merge(
@@ -130,6 +143,7 @@ const fixture = Effect.gen(function* () {
     service,
     location,
     failedLockPath,
+    legacyList,
   };
 });
 
@@ -150,6 +164,25 @@ it.layer(layer)("WorktreeProtection", (it) => {
       yield* f.command(["worktree", "remove", "--force", other]).pipe(Effect.flip);
       assert.isTrue(yield* f.fs.exists(other));
       yield* f.command(["worktree", "remove", f.path]);
+    }).pipe(Effect.scoped),
+  );
+
+  it.effect("handles legacy porcelain listings without releasing manual locks", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* Ref.set(f.legacyList, true);
+      yield* f.command(["worktree", "lock", "--reason", "manual reason with spaces", f.path]);
+      yield* f.service.reconcile(f.location);
+      assert.include(
+        (yield* f.command(["worktree", "list", "--porcelain"])).stdout,
+        "locked manual reason with spaces",
+      );
+      yield* f.command(["worktree", "unlock", f.path]);
+      yield* f.service.protect(f.location);
+      yield* f.command(["worktree", "remove", "--force", f.path]).pipe(Effect.flip);
+      yield* f.service.reconcile(f.location);
+      yield* f.command(["worktree", "remove", f.path]);
+      assert.isFalse(yield* f.fs.exists(f.path));
     }).pipe(Effect.scoped),
   );
 
@@ -259,6 +292,35 @@ it.layer(layer)("WorktreeProtection", (it) => {
         yield* f.command(["worktree", "remove", "--force", active]).pipe(Effect.flip);
         assert.isTrue(yield* f.fs.exists(active));
       }).pipe(Effect.scoped),
+  );
+
+  it.effect("releases a post-startup checkout after its moved session finishes detaching", () =>
+    Effect.gen(function* () {
+      const f = yield* fixture;
+      yield* f.service.reconcileAll;
+      const threadId = ThreadId.make("thread:moving");
+      const next = `${f.path}-next`;
+      yield* f.command(["worktree", "add", "-b", "next", next]);
+      yield* f.service.withReference(
+        { projectId: f.projectId, worktreePath: f.path },
+        Ref.set(f.references, [{ threadId, worktreePath: f.path }]),
+      );
+      yield* f.service.withReference(
+        { projectId: f.projectId, worktreePath: next },
+        Ref.set(f.references, [
+          { threadId, worktreePath: next },
+          { threadId, worktreePath: f.path },
+        ]),
+      );
+      yield* f.service.reconcile(f.location);
+      yield* f.command(["worktree", "remove", "--force", f.path]).pipe(Effect.flip);
+      yield* Ref.set(f.references, [{ threadId, worktreePath: next }]);
+      yield* f.service.reconcileAll;
+      yield* f.command(["worktree", "remove", f.path]);
+      assert.isFalse(yield* f.fs.exists(f.path));
+      yield* f.command(["worktree", "remove", "--force", next]).pipe(Effect.flip);
+      assert.isTrue(yield* f.fs.exists(next));
+    }).pipe(Effect.scoped),
   );
 
   it.effect("preserves a user's lock after all references retire", () =>

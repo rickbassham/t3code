@@ -9,7 +9,7 @@ import * as ProjectStore from "../orchestration-v2/ProjectStore.ts";
 import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
-import { withWorkspaceLease } from "./workspaceLease.ts";
+import { canonicalWorkspacePath, withWorkspaceLease } from "./workspaceLease.ts";
 import { WORKTREE_PROTECTION_REASON } from "./worktreeProtectionReason.ts";
 
 interface WorktreeLocation {
@@ -54,30 +54,38 @@ export const make = Effect.gen(function* () {
       detail,
       ...(cause === undefined ? {} : { cause }),
     });
-  const canonical = (target: string): Effect.Effect<string, GitCommandError> =>
-    fs.realPath(target).pipe(
-      Effect.catch((error) => {
-        if (error.reason._tag !== "NotFound")
-          return Effect.fail(
-            failure({ cwd: target, path: target }, "Could not resolve worktree location.", error),
-          );
-        const parent = path.dirname(target);
-        return parent === target
-          ? Effect.succeed(target)
-          : canonical(parent).pipe(Effect.map((real) => path.join(real, path.basename(target))));
-      }),
+  const canonical = (target: string) =>
+    canonicalWorkspacePath(fs, path, target).pipe(
+      Effect.mapError((cause) =>
+        failure({ cwd: target, path: target }, "Could not resolve worktree location.", cause),
+      ),
     );
   const withLease: WorktreeProtection["Service"]["withLease"] = (input, effect) =>
     canonical(path.resolve(input.cwd, input.path)).pipe(
       Effect.flatMap((target) => withWorkspaceLease(target, effect)),
     );
   const list = Effect.fn("WorktreeProtection.list")(function* (cwd: string) {
+    const args = ["worktree", "list", "--porcelain"];
     const result = yield* git.execute({
       operation: "WorktreeProtection.list",
       cwd,
-      args: ["worktree", "list", "--porcelain", "-z"],
+      args: [...args, "-z"],
+      env: { LC_ALL: "C" },
+      allowNonZeroExit: true,
     });
-    const listed = result.stdout.split("\0\0").flatMap((record) => {
+    let stdout = result.stdout;
+    if (result.exitCode !== 0) {
+      if (!/unknown (?:switch|option).*['`"]z['`"]/i.test(result.stderr))
+        return yield* failure({ cwd, path: cwd }, result.stderr || "Could not list Git worktrees.");
+      const legacy = yield* git.execute({
+        operation: "WorktreeProtection.list",
+        cwd,
+        args,
+        env: { LC_ALL: "C" },
+      });
+      stdout = legacy.stdout.replaceAll("\n", "\0");
+    }
+    const listed = stdout.split("\0\0").flatMap((record) => {
       const fields = record.split("\0");
       const location = fields.find((field) => field.startsWith("worktree "));
       if (location === undefined) return [];
@@ -221,7 +229,10 @@ export const make = Effect.gen(function* () {
       if (Option.isSome(project)) next = { cwd: project.value.workspaceRoot, path: worktreePath };
     }
     if (next === undefined) previous.delete(threadId);
-    else previous.set(threadId, next);
+    else {
+      previous.set(threadId, next);
+      knownPaths.set(yield* canonical(path.resolve(next.cwd, next.path)), next);
+    }
     if (next !== undefined) yield* withLease(next, reconcile(next));
     if (old !== undefined && (next === undefined || old.path !== next.path))
       yield* withLease(old, reconcile(old));
@@ -237,7 +248,17 @@ export const make = Effect.gen(function* () {
             failure({ cwd: ".", path: input.worktreePath }, "Thread project is unavailable."),
           );
         const location = { cwd: project.value.workspaceRoot, path: input.worktreePath };
-        return withLease(location, protect(location).pipe(Effect.andThen(effect)));
+        return canonical(path.resolve(location.cwd, location.path)).pipe(
+          Effect.flatMap((target) =>
+            withWorkspaceLease(
+              target,
+              protect(location).pipe(
+                Effect.andThen(effect),
+                Effect.tap(() => Effect.sync(() => knownPaths.set(target, location))),
+              ),
+            ),
+          ),
+        );
       }),
     );
   return WorktreeProtection.of({

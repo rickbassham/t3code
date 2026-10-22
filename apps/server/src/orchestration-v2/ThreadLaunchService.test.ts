@@ -121,6 +121,7 @@ interface HarnessOptions {
   readonly closeTerminal?: TerminalManager.TerminalManager["Service"]["close"];
   readonly adapters?: ReadonlyArray<ProviderAdapter.ProviderAdapterV2["Service"]>;
   readonly managedFolders?: Layer.Layer<ManagedProjectFolders.ManagedProjectFolders>;
+  readonly withLease?: WorktreeProtection.WorktreeProtection["Service"]["withLease"];
   readonly protect?: WorktreeProtection.WorktreeProtection["Service"]["protect"];
   readonly createWorktree?: GitWorkflow.GitWorkflowService["Service"]["createWorktree"];
   readonly fetchWorktreeBaseCommit?: GitWorkflow.GitWorkflowService["Service"]["fetchWorktreeBaseCommit"];
@@ -185,7 +186,7 @@ function makeHarness(options: HarnessOptions = {}) {
     WorktreeSetupTracker.layer,
     Layer.mock(WorktreeProtection.WorktreeProtection)({
       protect,
-      withLease: (_input, effect) => effect,
+      withLease: options.withLease ?? ((_input, effect) => effect),
     }),
     Layer.mock(ProjectCloneTracker.ProjectCloneTracker)({ get: () => Effect.succeed(null) }),
     Layer.mock(TerminalManager.TerminalManager)({ close: closeTerminal }),
@@ -1761,9 +1762,20 @@ it.effect("protects an attached worktree before releasing provider work", () =>
   Effect.gen(function* () {
     const entered = yield* Deferred.make<void>();
     const allowProtection = yield* Deferred.make<void>();
+    const leaseHeld = yield* Ref.make(false);
+    const protectedUnderLease = yield* Ref.make(false);
     const harness = makeHarness({
+      withLease: (_input, effect) =>
+        Ref.set(leaseHeld, true).pipe(
+          Effect.andThen(effect),
+          Effect.ensuring(Ref.set(leaseHeld, false)),
+        ),
       protect: () =>
-        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(allowProtection))),
+        Ref.get(leaseHeld).pipe(
+          Effect.flatMap((held) => Ref.set(protectedUnderLease, held)),
+          Effect.andThen(Deferred.succeed(entered, undefined)),
+          Effect.andThen(Deferred.await(allowProtection)),
+        ),
     });
     yield* Effect.gen(function* () {
       const launches = yield* ThreadLaunch.ThreadLaunchService;
@@ -1783,6 +1795,7 @@ it.effect("protects an attached worktree before releasing provider work", () =>
         )
         .pipe(Effect.forkChild);
       yield* Deferred.await(entered);
+      assert.isTrue(yield* Ref.get(protectedUnderLease));
       const pending = yield* threads.getThreadProjection(
         ThreadId.make("thread:launch:protect-existing"),
       );

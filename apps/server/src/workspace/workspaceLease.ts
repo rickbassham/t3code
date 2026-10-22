@@ -1,5 +1,26 @@
 import * as Effect from "effect/Effect";
+import type * as FileSystem from "effect/FileSystem";
+import type * as Path from "effect/Path";
+import type * as PlatformError from "effect/PlatformError";
 import * as Semaphore from "effect/Semaphore";
+
+/** Missing checkouts still share a key with their nearest existing path alias. */
+export const canonicalWorkspacePath = (
+  fileSystem: FileSystem.FileSystem,
+  path: Path.Path,
+  target: string,
+): Effect.Effect<string, PlatformError.PlatformError> =>
+  fileSystem.realPath(target).pipe(
+    Effect.catch((error) => {
+      if (error.reason._tag !== "NotFound") return Effect.fail(error);
+      const parent = path.dirname(target);
+      return parent === target
+        ? Effect.succeed(target)
+        : canonicalWorkspacePath(fileSystem, path, parent).pipe(
+            Effect.map((real) => path.join(real, path.basename(target))),
+          );
+    }),
+  );
 
 const leases = new Map<string, { semaphore: Semaphore.Semaphore; users: number }>();
 

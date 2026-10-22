@@ -20,7 +20,7 @@ import * as GitWorkflowService from "../git/GitWorkflowService.ts";
 import type * as ServerConfig from "../config.ts";
 import type * as ServerSettings from "../serverSettings.ts";
 import { makeIsManagedWorktreePath } from "../worktreesDirectory.ts";
-import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import { canonicalWorkspacePath, withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import {
   isCheckpointRestoreIsolated,
   SHARED_WORKSPACE_RESTORE_MESSAGE,
@@ -362,7 +362,9 @@ export const layer: Layer.Layer<
           const thread = yield* projections.getThread(input.threadId);
           yield* thread.worktreePath === null
             ? execute(input)
-            : withWorkspaceLease(path.resolve(thread.worktreePath), execute(input));
+            : canonicalWorkspacePath(fileSystem, path, path.resolve(thread.worktreePath)).pipe(
+                Effect.flatMap((target) => withWorkspaceLease(target, execute(input))),
+              );
         },
         (effect, input) =>
           effect.pipe(
