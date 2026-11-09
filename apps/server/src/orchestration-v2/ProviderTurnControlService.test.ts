@@ -15,6 +15,9 @@ import {
   ThreadId,
 } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
+import * as Deferred from "effect/Deferred";
+import * as Fiber from "effect/Fiber";
+import * as TestClock from "effect/testing/TestClock";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
 import * as Layer from "effect/Layer";
@@ -27,6 +30,7 @@ import * as ProjectionStore from "./ProjectionStore.ts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 import * as ProviderTurnControlService from "./ProviderTurnControlService.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 
 const driver = ProviderDriverKind.make("codex");
 const providerInstanceId = ProviderInstanceId.make("codex");
@@ -345,5 +349,130 @@ it.effect(
       assert.equal(interrupted?.providerSessionId, oldSessionId);
       assert.equal(interrupted?.id, providerThreadId);
       assert.equal(interrupted?.nativeThreadRef?.nativeId, "native-thread:restart-session");
+    }),
+);
+
+it.effect.each(["stop", "stalled"])(
+  "handles %s during a PR goal pause without retaining the thread lock",
+  (scenario) =>
+    Effect.gen(function* () {
+      const now = yield* DateTime.now;
+      const threadId = ThreadId.make("thread:stop-during-goal-wait");
+      const providerSessionId = ProviderSessionId.make("session:stop-during-goal-wait");
+      const providerThreadId = ProviderThreadId.make("provider-thread:stop-during-goal-wait");
+      const providerTurnId = ProviderTurnId.make("provider-turn:stop-during-goal-wait");
+      const wait = {
+        host: "github.com",
+        repository: "owner/repo",
+        number: 414,
+        startedAt: "2026-10-23T21:00:00.000Z",
+      };
+      const providerThread = {
+        id: providerThreadId,
+        driver,
+        providerInstanceId,
+        providerSessionId,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "active",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+        goalWait: wait,
+      } satisfies OrchestrationV2ProviderThread;
+      let stopped = false;
+      let pauses = 0;
+      const entered = yield* Deferred.make<void>();
+      const runtime = {
+        instanceId: providerInstanceId,
+        driver,
+        providerSessionId,
+        providerSession: {
+          id: providerSessionId,
+          driver,
+          providerInstanceId,
+          status: "running",
+          cwd: "/workspace",
+          model: modelSelection.model,
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: now,
+          updatedAt: now,
+          lastError: null,
+        },
+        events: Stream.empty,
+        waitForGoal: () =>
+          Effect.gen(function* () {
+            pauses += 1;
+            yield* Deferred.succeed(entered, undefined);
+            if (scenario === "stalled") return yield* Effect.never;
+          }),
+        ensureThread: () => Effect.die("unused"),
+        resumeThread: () => Effect.die("unused"),
+        startTurn: () => Effect.die("unused"),
+        steerTurn: () => Effect.die("unused"),
+        interruptTurn: () => Effect.die("unused"),
+        respondToRuntimeRequest: () => Effect.die("unused"),
+        readThreadSnapshot: () => Effect.die("unused"),
+        rollbackThread: () => Effect.die("unused"),
+        forkThread: () => Effect.die("unused"),
+      } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+      const dependencies = Layer.mergeAll(
+        Layer.mock(ProjectionStore.ProjectionStoreV2)({
+          getProviderControlContext: () =>
+            Effect.sync(() => ({
+              providerThread: { ...providerThread, goalWait: stopped ? null : wait },
+              providerTurn: undefined,
+              attempt: undefined,
+              message: undefined,
+              run: undefined,
+            })),
+        }),
+        Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+          get: () =>
+            Effect.sync(() => {
+              stopped = scenario === "stop";
+              return Option.some(runtime);
+            }),
+        }),
+      );
+      yield* Effect.gen(function* () {
+        const service = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+        const pause = service.waitForGoal({
+          threadId,
+          providerSessionId,
+          providerThreadId,
+          providerTurnId,
+          wait,
+        });
+        if (scenario === "stop") {
+          yield* pause;
+          assert.equal(pauses, 0);
+          return;
+        }
+        const pending = yield* pause.pipe(Effect.exit, Effect.forkScoped);
+        yield* Deferred.await(entered);
+        const commands = yield* ThreadCommandExecutor.ThreadCommandExecutor;
+        const nextCommand = yield* commands
+          .withLock(threadId, Effect.succeed("released"))
+          .pipe(Effect.forkScoped);
+        yield* TestClock.adjust("15 seconds");
+        const result = yield* Fiber.join(pending);
+        assert.isTrue(Exit.isFailure(result));
+        assert.equal(yield* Fiber.join(nextCommand), "released");
+        assert.equal(pauses, 1);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.merge(
+            ProviderTurnControlService.layer.pipe(Layer.provide(dependencies)),
+            ThreadCommandExecutor.layer,
+          ),
+        ),
+      );
     }),
 );

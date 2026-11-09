@@ -264,6 +264,10 @@ export const layer: Layer.Layer<
         input: ProviderEventIngestInput,
         payloadInput: {
           readonly type: OrchestrationV2DomainEvent["type"];
+          readonly goalWaitChange?: Extract<
+            OrchestrationV2DomainEvent,
+            { readonly type: "provider-thread.updated" }
+          >["goalWaitChange"];
           readonly payload: OrchestrationV2DomainEvent["payload"];
           readonly threadId?: ThreadId;
           readonly runId?: RunId | null;
@@ -289,6 +293,7 @@ export const layer: Layer.Layer<
             rawEventId: input.rawEventId,
             occurredAt,
             payload: payloadInput.payload,
+            goalWaitChange: payloadInput.goalWaitChange,
           }),
         );
       });
@@ -506,6 +511,9 @@ export const layer: Layer.Layer<
                 type: "provider-thread.updated",
                 threadId,
                 payload: input.event.providerThread,
+                ...(input.event.goalWaitChange === undefined
+                  ? {}
+                  : { goalWaitChange: input.event.goalWaitChange }),
               });
               return input.event.retainedNativeTurnIds === undefined
                 ? [updated]

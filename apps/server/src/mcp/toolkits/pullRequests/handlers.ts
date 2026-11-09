@@ -263,6 +263,7 @@ const make = Effect.gen(function* () {
   const setWatching = Effect.fn("PullRequestsToolkit.setWatching")(function* (
     input: PullRequestTargetInput,
     watching: boolean,
+    waitForUpdate?: boolean,
   ) {
     const thread = yield* requireThread(PullRequestWatchFailedError, input.threadId);
     const project = yield* projectOf(thread, PullRequestWatchFailedError);
@@ -281,6 +282,7 @@ const make = Effect.gen(function* () {
     yield* engine
       .dispatch({
         type: "thread.pull-request.watch",
+        ...(waitForUpdate === true ? { waitForUpdate: true } : {}),
         commandId: yield* commandId("mcp-pr-watch", thread.id),
         threadId: thread.id,
         host: target.host,
@@ -520,7 +522,7 @@ const make = Effect.gen(function* () {
         Effect.map(listThreadPullRequests),
       ),
     ),
-    watch_pull_request: writesThread((input) => setWatching(input, true)),
+    watch_pull_request: writesThread((input) => setWatching(input, true, input.waitForUpdate)),
     unwatch_pull_request: writesThread((input) => setWatching(input, false)),
     write_pull_request_guides: McpToolAccess.writesWithCapability((input) =>
       Effect.gen(function* () {

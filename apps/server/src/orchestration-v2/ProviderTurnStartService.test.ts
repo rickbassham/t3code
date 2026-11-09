@@ -26,6 +26,8 @@ import * as Cause from "effect/Cause";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as TestClock from "effect/testing/TestClock";
 import * as FileSystem from "effect/FileSystem";
 import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
@@ -33,8 +35,10 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
+import * as DelegatedTaskReadiness from "./DelegatedTaskReadiness.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
 import * as GitWorkflow from "../git/GitWorkflowService.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
@@ -132,6 +136,11 @@ function startWithMissingWorktree(
   const createWorktree = vi.fn(() => Effect.succeed({} as never));
   const listLocalBranchNames = vi.fn(() => Effect.succeed(["feature/restore"]));
   const layer = ProviderTurnStart.layer.pipe(
+    Layer.provide(
+      Layer.mock(DelegatedTaskReadiness.DelegatedTaskReadiness)({
+        pending: () => Effect.succeed(false),
+      }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({}),
@@ -803,7 +812,7 @@ function makeLocalCommandHarness(input: {
     forkThread,
     startTurn,
   };
-  const open = vi.fn(() =>
+  const open = vi.fn<ProviderSessionManager.ProviderSessionManagerV2Shape["open"]>(() =>
     input.sideChat !== undefined
       ? Effect.succeed(sideChatSession as never)
       : input.interruptOpen === true
@@ -913,6 +922,11 @@ function makeLocalCommandHarness(input: {
     }),
   );
   const layer = ProviderTurnStart.layer.pipe(
+    Layer.provide(
+      Layer.mock(DelegatedTaskReadiness.DelegatedTaskReadiness)({
+        pending: () => Effect.succeed(false),
+      }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         Layer.mock(ContextHandoffService.ContextHandoffServiceV2)({
@@ -1141,7 +1155,7 @@ effectIt.effect(
           failReadsAfterRunning: true,
         });
         const open = harness.open.getMockImplementation()!;
-        harness.open.mockImplementation(() =>
+        harness.open.mockImplementation((input) =>
           Effect.gen(function* () {
             expect(yield* git(worktreePath, ["branch", "--show-current"])).toBe("feature/restore");
             expect(yield* git(worktreePath, ["rev-parse", "HEAD"])).toBe(expected.tip);
@@ -1159,7 +1173,7 @@ effectIt.effect(
               ).toBe(expected.upstream);
             }
             expect(yield* branchConfig("t3-merge-base")).toBe(expected.base);
-            return yield* open();
+            return yield* open(input);
           }).pipe(Effect.orDie),
         );
 
@@ -1438,12 +1452,12 @@ effectIt.effect.each(["cleanup-first", "startup-first"])(
         fileSystem.makeDirectory(worktreePath).pipe(Effect.as({} as never), Effect.orDie),
       );
       const open = harness.open.getMockImplementation()!;
-      harness.open.mockImplementation(() =>
+      harness.open.mockImplementation((input) =>
         Effect.gen(function* () {
           expect(yield* fileSystem.exists(worktreePath).pipe(Effect.orDie)).toBe(true);
           yield* Deferred.succeed(openEntered, undefined);
           if (order === "startup-first") yield* Deferred.await(release);
-          return yield* open();
+          return yield* open(input);
         }),
       );
       let cleanupEntered = false;
@@ -1849,3 +1863,123 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect.each(["unwatch", "stalled", "failure"])(
+  "handles %s immediately before starting a watcher wake",
+  (scenario) =>
+    Effect.gen(function* () {
+      const harness = makeLocalCommandHarness({ text: "A pull request changed." });
+      const initial = harness.projection();
+      const originalThread = initial.providerThreads.find(
+        (thread) => thread.id === initial.thread.activeProviderThreadId,
+      );
+      if (originalThread === undefined || originalThread.providerSessionId === null)
+        return yield* Effect.die("Missing provider fixture");
+      const wait = {
+        host: "github.com",
+        repository: "owner/repo",
+        number: 414,
+        startedAt: "2026-10-23T21:00:00.000Z",
+      };
+      const providerThread = {
+        ...originalThread,
+        goal: { objective: "Ship the feature", status: "paused" },
+        goalWait: wait,
+      } satisfies OrchestrationV2ThreadProjection["providerThreads"][number];
+      harness.setProjection({ ...initial, providerThreads: [providerThread] });
+      const entered = yield* Deferred.make<void>();
+      const result =
+        yield* Deferred.make<Exit.Exit<void, ProviderAdapter.ProviderAdapterV2Error>>();
+      const failure = new ProviderAdapter.ProviderAdapterTurnStartError({
+        driver: providerThread.driver,
+        threadId: initial.thread.id,
+        providerThreadId: providerThread.id,
+        runId: initial.runs[0]!.id,
+        cause: "native failure",
+      });
+      const startTurn = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"]>(() =>
+        Effect.gen(function* () {
+          yield* Deferred.succeed(entered, undefined);
+          if (scenario === "stalled") return yield* Effect.never;
+          if (scenario === "failure") return yield* failure;
+        }),
+      );
+      const runtime = {
+        instanceId: providerThread.providerInstanceId,
+        driver: providerThread.driver,
+        providerSessionId: originalThread.providerSessionId,
+        providerSession: {
+          id: originalThread.providerSessionId,
+          driver: providerThread.driver,
+          providerInstanceId: providerThread.providerInstanceId,
+          status: "running",
+          cwd: "/tmp/native-account-command",
+          model: "gpt-5.4",
+          capabilities: CodexProviderCapabilitiesV2,
+          createdAt: providerThread.createdAt,
+          updatedAt: providerThread.updatedAt,
+          lastError: null,
+        },
+        events: Stream.empty,
+        ensureThread: () => Effect.succeed(providerThread),
+        resumeThread: () => Effect.succeed(providerThread),
+        startTurn,
+        steerTurn: () => Effect.die("unused"),
+        interruptTurn: () => Effect.die("unused"),
+        respondToRuntimeRequest: () => Effect.die("unused"),
+        readThreadSnapshot: () => Effect.die("unused"),
+        rollbackThread: () => Effect.die("unused"),
+        forkThread: () => Effect.die("unused"),
+      } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+      harness.open.mockImplementation(() => Effect.succeed(runtime));
+      harness.startRootRun.mockImplementation((input) =>
+        Effect.gen(function* () {
+          // Unwatch committed after the turn input was prepared, before native activation.
+          const current = harness.projection();
+          if (scenario === "unwatch")
+            harness.setProjection({
+              ...current,
+              providerThreads: current.providerThreads.map((thread) => ({
+                ...thread,
+                goalWait: { ...wait, resumeOnUpdate: false },
+              })),
+            });
+          yield* input.session
+            .startTurn({
+              appThread: input.appThread,
+              threadId: input.run.threadId,
+              runId: input.run.id,
+              runOrdinal: input.run.ordinal,
+              providerTurnOrdinal: input.providerTurnOrdinal,
+              attemptId: input.attemptId,
+              rootNodeId: input.rootNode.id,
+              providerThread: input.providerThread,
+              message: input.message,
+              modelSelection: input.modelSelection,
+              runtimePolicy: input.runtimePolicy,
+            })
+            .pipe(
+              Effect.exit,
+              Effect.flatMap((exit) => Deferred.succeed(result, exit)),
+            );
+        }),
+      );
+      const pending = yield* harness.start.pipe(Effect.forkScoped);
+      yield* Deferred.await(entered);
+      if (scenario === "stalled") yield* TestClock.adjust("15 seconds");
+      yield* Fiber.join(pending);
+      const exit = yield* Deferred.await(result);
+      expect(startTurn).toHaveBeenCalledOnce();
+      if (scenario === "unwatch") {
+        expect(Exit.isSuccess(exit)).toBe(true);
+        expect(startTurn.mock.calls[0]?.[0].providerThread.goalWait?.resumeOnUpdate).toBe(false);
+      } else {
+        expect(Exit.isFailure(exit)).toBe(true);
+        if (Exit.isFailure(exit)) {
+          const error = Cause.squash(exit.cause);
+          expect(error).toBeInstanceOf(ProviderAdapter.ProviderAdapterTurnStartError);
+          if (scenario === "failure") expect(error).toBe(failure);
+        }
+      }
+    }).pipe(Effect.scoped),
+);

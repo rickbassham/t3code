@@ -248,6 +248,17 @@ export const OrchestratorMcpDelegateTaskResult = Schema.Struct({
 });
 export type OrchestratorMcpDelegateTaskResult = typeof OrchestratorMcpDelegateTaskResult.Type;
 
+export const OrchestratorMcpWaitForTasksInput = Schema.Struct({
+  taskIds: Schema.Array(NodeId).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+  clientRequestId: Schema.optional(OrchestratorMcpClientRequestId),
+});
+export type OrchestratorMcpWaitForTasksInput = typeof OrchestratorMcpWaitForTasksInput.Type;
+export const OrchestratorMcpWaitForTasksResult = Schema.Struct({
+  waiting: Schema.Boolean,
+  taskIds: Schema.Array(NodeId),
+});
+export type OrchestratorMcpWaitForTasksResult = typeof OrchestratorMcpWaitForTasksResult.Type;
+
 export const OrchestratorMcpTaskStatusInput = Schema.Struct({
   taskId: NodeId,
 });
