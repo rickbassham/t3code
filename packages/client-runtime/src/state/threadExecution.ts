@@ -362,6 +362,7 @@ export interface ProviderGoalPresentation {
   readonly objective: string;
   readonly usage: string | null;
   readonly canResume: boolean;
+  readonly waitReason: string | null;
 }
 
 const PROVIDER_GOAL_TITLES: Record<OrchestrationV2ProviderGoal["status"], string> = {
@@ -383,6 +384,8 @@ export function presentProviderGoal(
   goal: OrchestrationV2ProviderGoal,
   working: boolean,
 ): ProviderGoalPresentation {
+  const wait =
+    goal.status === "paused" || goal.status === "active" ? goal.waitingForPullRequest : undefined;
   const usage: Array<string> = [];
   if (goal.tokensUsed !== undefined && goal.tokensUsed > 0) {
     usage.push(
@@ -398,10 +401,16 @@ export function presentProviderGoal(
     usage.push(`${goal.checks} ${goal.checks === 1 ? "check" : "checks"}`);
   }
   return {
-    title: goal.status === "active" && !working ? "Goal set" : PROVIDER_GOAL_TITLES[goal.status],
+    title:
+      wait === undefined
+        ? goal.status === "active" && !working
+          ? "Goal set"
+          : PROVIDER_GOAL_TITLES[goal.status]
+        : `Waiting for PR #${wait.number}`,
     objective: goal.objective,
     usage: usage.length === 0 ? null : usage.join(" · "),
-    canResume: goal.status !== "active" && goal.status !== "complete",
+    canResume: wait === undefined && goal.status !== "active" && goal.status !== "complete",
+    waitReason: wait === undefined ? null : "Continues automatically when the PR changes.",
   };
 }
 

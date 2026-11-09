@@ -728,6 +728,26 @@ describe("provider-reported model selection", () => {
 });
 
 describe("presentProviderGoal", () => {
+  it("distinguishes automatic PR waiting from a user pause", () => {
+    const goal = { objective: "Ship the feature", status: "paused" } satisfies Parameters<
+      typeof presentProviderGoal
+    >[0];
+    const waitingForPullRequest = { host: "github.com", repository: "owner/repo", number: 415 };
+    const waiting = presentProviderGoal({ ...goal, waitingForPullRequest }, false);
+    expect(waiting.title).toBe("Waiting for PR #415");
+    expect(
+      presentProviderGoal({ ...goal, status: "active", waitingForPullRequest }, false).title,
+    ).toBe(waiting.title);
+    expect(waiting.canResume).toBe(false);
+    expect(waiting.waitReason).toBe("Continues automatically when the PR changes.");
+    expect(presentProviderGoal(goal, false).canResume).toBe(true);
+    for (const status of ["complete", "blocked", "usage_limited", "budget_limited"] as const) {
+      expect(presentProviderGoal({ ...goal, status, waitingForPullRequest }, false).title).not.toBe(
+        waiting.title,
+      );
+    }
+  });
+
   it("summarizes Codex accounting and offers resume once the goal stops short", () => {
     expect(
       presentProviderGoal(
@@ -745,6 +765,7 @@ describe("presentProviderGoal", () => {
       objective: "Ship the feature",
       usage: "12k / 50k tokens · 4m 5s",
       canResume: true,
+      waitReason: null,
     });
   });
 
@@ -756,6 +777,7 @@ describe("presentProviderGoal", () => {
       objective: "All tests pass",
       usage: "1 check",
       canResume: false,
+      waitReason: null,
     });
     expect(
       presentProviderGoal({ objective: "All tests pass", status: "complete", checks: 0 }, false)

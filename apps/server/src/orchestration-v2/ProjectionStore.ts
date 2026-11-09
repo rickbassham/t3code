@@ -1,3 +1,4 @@
+import { presentProviderThreadGoal } from "@t3tools/shared/providerGoal";
 import { applyThreadPullRequestLinkUpdate } from "@t3tools/shared/threadPullRequests";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
@@ -1660,6 +1661,7 @@ export function threadShellFromProjection(
     goal: activeProviderGoalForShell(
       projection.providerThreads,
       projection.thread.activeProviderThreadId,
+      projection.thread,
     ),
     itemCount: activeLocalTurnItems(projection).length,
     visibleItemCount: projection.visibleTurnItems.length,
@@ -1706,8 +1708,12 @@ function providerInstanceHistoryForShell(input: {
 function activeProviderGoalForShell(
   providerThreads: ReadonlyArray<OrchestrationV2ThreadProjection["providerThreads"][number]>,
   activeProviderThreadId: OrchestrationV2ThreadProjection["thread"]["activeProviderThreadId"],
+  appThread: OrchestrationV2AppThread,
 ): OrchestrationV2ThreadShell["goal"] {
-  return providerThreads.find((thread) => thread.id === activeProviderThreadId)?.goal ?? null;
+  return presentProviderThreadGoal(
+    providerThreads.find((thread) => thread.id === activeProviderThreadId),
+    appThread,
+  );
 }
 
 function isInterruptibleRunForShell(run: OrchestrationV2ThreadProjection["runs"][number]): boolean {
@@ -6337,6 +6343,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           goal: activeProviderGoalForShell(
             providerThreadsByThreadId.get(thread.id) ?? [],
             thread.activeProviderThreadId,
+            thread,
           ),
           itemCount: row.item_count,
           runlessItemCount: row.runless_item_count,

@@ -1,3 +1,4 @@
+import { presentProviderThreadGoal } from "@t3tools/shared/providerGoal";
 import { formatFilePathForClipboard } from "@t3tools/client-runtime/media-actions";
 import { resolvePathLinkTarget } from "@t3tools/shared/fileLinks";
 import { ThreadFind, ThreadFindCanvas, type ThreadFindControls } from "./chat/ThreadFindProvider";
@@ -1174,10 +1175,12 @@ export default function ChatView(props: ChatViewProps) {
               .map((thread) => thread.providerInstanceId),
           ),
         ],
-        goal:
+        goal: presentProviderThreadGoal(
           serverProjection.providerThreads.find(
             (thread) => thread.id === serverProjection.thread.activeProviderThreadId,
-          )?.goal ?? null,
+          ),
+          serverProjection.thread,
+        ),
         itemCount: serverProjection.turnItems.length,
         visibleItemCount: serverProjection.visibleTurnItems.length,
         updatedAt: serverProjection.updatedAt,
@@ -5400,7 +5403,10 @@ export default function ChatView(props: ChatViewProps) {
         presentation.usage === null
           ? presentation.title
           : `${presentation.title} · ${presentation.usage}`,
-      description: presentation.objective,
+      description:
+        presentation.waitReason === null
+          ? presentation.objective
+          : `${presentation.waitReason} ${presentation.objective}`,
       actions: isWorking ? undefined : (
         <>
           {presentation.canResume ? (

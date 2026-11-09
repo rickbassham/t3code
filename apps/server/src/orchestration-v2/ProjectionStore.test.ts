@@ -3216,6 +3216,8 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
       const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
       const now = yield* DateTime.now;
       const threadId = ThreadId.make("thread:provider-goal");
+      const key = { host: "github.com", repository: "owner/repo", number: 415 };
+      const wait = { ...key, startedAt: "2026-10-24T02:14:49.295Z" };
       yield* projectionStore.apply({
         id: EventId.make("event:provider-goal:thread"),
         type: "thread.created",
@@ -3227,6 +3229,27 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           id: threadId,
           projectId: ProjectId.make("project:provider-goal"),
           title: "Provider goal",
+          pullRequests: [
+            {
+              ...key,
+              url: "https://github.com/owner/repo/pull/415",
+              source: "agent",
+              linkedAt: wait.startedAt,
+              snapshot: null,
+              stack: null,
+              watch: {
+                startedAt: wait.startedAt,
+                headSha: null,
+                failedChecks: [],
+                passed: false,
+                passedChecks: [],
+                remarksThrough: wait.startedAt,
+                remarkIds: [],
+                conflicting: false,
+                wakes: 0,
+              },
+            },
+          ],
           providerInstanceId,
           modelSelection,
           runtimeMode: "full-access",
@@ -3249,6 +3272,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         suffix: string,
         goal: OrchestrationV2ProviderThread["goal"],
         seconds: number,
+        wait?: OrchestrationV2ProviderThread["goalWaitForPullRequest"],
       ) =>
         projectionStore.apply({
           id: EventId.make(`event:provider-goal:${suffix}:${seconds}`),
@@ -3256,6 +3280,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
           threadId,
           driver,
           occurredAt: DateTime.add(now, { seconds }),
+          ...(wait === undefined ? {} : { goalWaitChange: { wait } }),
           payload: {
             id: ProviderThreadId.make(`provider-thread:provider-goal:${suffix}`),
             driver,
@@ -3283,7 +3308,35 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
 
       yield* applyProviderThread("first", goal, 0);
       assert.deepEqual(yield* shellGoal, goal);
-      yield* applyProviderThread("second", null, 1);
+
+      for (const currentWait of [wait, { ...wait, resumeOnUpdate: false }, null]) {
+        yield* applyProviderThread("first", { ...goal, status: "paused" }, 1, currentWait);
+        const expected =
+          currentWait != null && !("resumeOnUpdate" in currentWait) ? key : undefined;
+        assert.deepEqual((yield* shellGoal)?.waitingForPullRequest, expected);
+        assert.equal((yield* shellGoal)?.status, expected === undefined ? "paused" : "active");
+        assert.deepEqual(
+          (yield* projectionStore.getThreadShell(threadId))?.goal?.waitingForPullRequest,
+          expected,
+        );
+        const records = yield* projectionStore.getThreadRecords(threadId, ["providerThreads"]);
+        assert.equal(records.providerThreads[0]?.goal?.status, "paused");
+      }
+      yield* applyProviderThread("first", { ...goal, status: "paused" }, 2, wait);
+      const thread = yield* projectionStore.getThread(threadId);
+      yield* projectionStore.apply({
+        id: EventId.make("event:provider-goal:watch-ended"),
+        type: "thread.pull-request-synced",
+        threadId,
+        occurredAt: DateTime.add(now, { seconds: 3 }),
+        payload: { ...thread, pullRequests: [] },
+      });
+      assert.equal((yield* shellGoal)?.status, "paused");
+      assert.isUndefined((yield* shellGoal)?.waitingForPullRequest);
+      assert.isUndefined(
+        (yield* projectionStore.getThreadShell(threadId))?.goal?.waitingForPullRequest,
+      );
+      yield* applyProviderThread("second", null, 4);
       assert.isNull(yield* shellGoal);
     }),
   );
