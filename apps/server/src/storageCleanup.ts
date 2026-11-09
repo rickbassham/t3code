@@ -49,6 +49,7 @@ import { isFilesystemRoot, managedWorktreesDirectories } from "./worktreesDirect
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import { removeLinkedWorktree } from "./vcs/worktreeRemoval.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
+import * as WorktreeProtection from "./workspace/WorktreeProtection.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { isNetworkPath } from "@t3tools/shared/path";
@@ -303,6 +304,7 @@ const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
   const terminals = yield* TerminalManager.TerminalManager;
+  const protection = yield* WorktreeProtection.WorktreeProtection;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const liveTerminals = new Map<string, Map<string, TerminalSummary>>();
@@ -1215,15 +1217,18 @@ const make = Effect.gen(function* () {
               const changes = yield* localChangesReason(worktreePath, settings);
               if (changes !== null) return keep(changes);
             }
-            yield* removeLinkedWorktree({
-              operation: "StorageCleanup.cleanupGit",
-              cwd: project.workspaceRoot,
-              worktreePath,
-              // Git requires force for submodules; recursive checks above cannot make removal atomic.
-              force: submodules.force,
-              execute: git.execute,
-              run: (args) => cleanupGit(project.workspaceRoot, [...args], "git worktree remove"),
-            });
+            yield* protection.withoutLock(
+              { cwd: project.workspaceRoot, path: worktreePath },
+              removeLinkedWorktree({
+                operation: "StorageCleanup.cleanupGit",
+                cwd: project.workspaceRoot,
+                worktreePath,
+                // Git requires force for submodules; recursive checks above cannot make removal atomic.
+                force: submodules.force,
+                execute: git.execute,
+                run: (args) => cleanupGit(project.workspaceRoot, [...args], "git worktree remove"),
+              }),
+            );
             entries.push({ ...entry, outcome: "removed", reason: sentence(removalReason), bytes });
             yield* gitManager.invalidateStatus(project.workspaceRoot);
             // Preserve branch/path so ProviderTurnStartService can recreate the checkout on resume.

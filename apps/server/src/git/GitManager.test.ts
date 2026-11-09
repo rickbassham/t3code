@@ -64,6 +64,7 @@ import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as ProjectSetupScriptRunner from "../project/ProjectSetupScriptRunner.ts";
 import * as ProviderRegistry from "../provider/ProviderRegistry.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import * as GitManager from "./GitManager.ts";
 
 /** A change request the fake host reports. Omitted fields read as an open, undated request. */
@@ -775,6 +776,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
             Layer.provide(
               GitWorkflowService.layer.pipe(
                 Layer.provide(Layer.succeed(GitManager.GitManager, manager)),
+                Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
                 Layer.provide(
                   VcsDriverRegistry.layer.pipe(
                     Layer.provide(VcsProjectConfig.layer),
@@ -4607,6 +4609,7 @@ it.layer(layerGitManagerTest)("GitManager", (it) => {
         const events: string[] = [];
         const workflows = yield* Effect.forEach([0, 1], () =>
           GitWorkflowService.make.pipe(
+            Effect.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
             // Cache the real filesystem result so startImmediately reaches lease acquisition.
             Effect.provideService(FileSystem.FileSystem, {
               ...fileSystem,
