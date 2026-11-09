@@ -1,7 +1,7 @@
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   MessageId,
-  OrchestrationV2PullRequestGoalWait,
+  OrchestrationV2GoalWait,
   type NodeId,
   ProviderSessionId,
   ProviderThreadId,
@@ -45,11 +45,11 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
 ) {}
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
-const pullRequestGoalWaitEqual = Schema.toEquivalence(OrchestrationV2PullRequestGoalWait);
+const goalWaitEqual = Schema.toEquivalence(OrchestrationV2GoalWait);
 
 export interface ProviderTurnControlServiceV2Shape {
-  readonly waitForPullRequest: (input: {
-    readonly wait: OrchestrationV2PullRequestGoalWait;
+  readonly waitForGoal: (input: {
+    readonly wait: OrchestrationV2GoalWait;
     readonly threadId: ThreadId;
     readonly providerSessionId: ProviderSessionId;
     readonly providerThreadId: ProviderThreadId;
@@ -190,23 +190,15 @@ export const layer: Layer.Layer<
     });
 
     return ProviderTurnControlServiceV2.of({
-      waitForPullRequest: Effect.fn("ProviderTurnControlService.waitForPullRequest")(
+      waitForGoal: Effect.fn("ProviderTurnControlService.waitForGoal")(
         function* (input) {
           const context = yield* projections.getProviderControlContext(input.threadId, input);
-          const wait = context.providerThread?.goalWaitForPullRequest;
-          if (
-            wait == null ||
-            wait.startedAt !== input.wait.startedAt ||
-            wait.host !== input.wait.host ||
-            wait.repository !== input.wait.repository ||
-            wait.number !== input.wait.number ||
-            wait.resumeOnUpdate !== input.wait.resumeOnUpdate
-          )
-            return;
+          const wait = context.providerThread?.goalWait;
+          if (wait == null || !goalWaitEqual(wait, input.wait)) return;
           const session = yield* sessions.get(input.providerSessionId);
           // A restarted session reconciles the durable wait before its next turn.
           if (Option.isNone(session)) return;
-          if (session.value.waitForPullRequest === undefined) {
+          if (session.value.waitForGoal === undefined) {
             return yield* new ProviderTurnControlError({
               ...input,
               operation: "wait",
@@ -214,14 +206,14 @@ export const layer: Layer.Layer<
             });
           }
           const current = yield* projections.getProviderControlContext(input.threadId, input);
-          const currentWait = current.providerThread?.goalWaitForPullRequest;
+          const currentWait = current.providerThread?.goalWait;
           if (
             currentWait == null ||
-            !pullRequestGoalWaitEqual(currentWait, input.wait) ||
+            !goalWaitEqual(currentWait, input.wait) ||
             current.providerThread === undefined
           )
             return;
-          yield* session.value.waitForPullRequest({
+          yield* session.value.waitForGoal({
             providerThread: current.providerThread,
             providerTurnId: input.providerTurnId,
           });

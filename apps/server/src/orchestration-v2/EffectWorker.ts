@@ -142,8 +142,9 @@ export const layerExecutor: Layer.Layer<
                 ),
               );
           case "provider-goal.wait-for-pull-request":
+          case "provider-goal.wait":
             return providerTurnControl
-              .waitForPullRequest({
+              .waitForGoal({
                 wait: effect.request.wait,
                 threadId: effect.threadId,
                 providerSessionId: effect.request.providerSessionId,

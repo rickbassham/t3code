@@ -1,3 +1,4 @@
+import * as DelegatedTaskReadiness from "./DelegatedTaskReadiness.ts";
 import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import * as WorktreeProtectionTestkit from "../workspace/WorktreeProtection.testkit.ts";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -130,6 +131,11 @@ function startWithMissingWorktree(
   const createWorktree = vi.fn(() => Effect.succeed({} as never));
   const protectWorktree = vi.fn(() => Effect.void);
   const layer = ProviderTurnStart.layer.pipe(
+    Layer.provide(
+      Layer.mock(DelegatedTaskReadiness.DelegatedTaskReadiness)({
+        pending: () => Effect.succeed(false),
+      }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         WorktreeProtectionTestkit.layer,
@@ -638,6 +644,11 @@ function makeLocalCommandHarness(input: {
     }),
   );
   const layer = ProviderTurnStart.layer.pipe(
+    Layer.provide(
+      Layer.mock(DelegatedTaskReadiness.DelegatedTaskReadiness)({
+        pending: () => Effect.succeed(false),
+      }),
+    ),
     Layer.provide(
       Layer.mergeAll(
         WorktreeProtectionTestkit.layer,
@@ -1313,7 +1324,7 @@ effectIt.effect.each(["unwatch", "stalled", "failure"])(
       const providerThread = {
         ...originalThread,
         goal: { objective: "Ship the feature", status: "paused" },
-        goalWaitForPullRequest: wait,
+        goalWait: wait,
       } satisfies OrchestrationV2ThreadProjection["providerThreads"][number];
       harness.setProjection({ ...initial, providerThreads: [providerThread] });
       const entered = yield* Deferred.make<void>();
@@ -1370,7 +1381,7 @@ effectIt.effect.each(["unwatch", "stalled", "failure"])(
               ...current,
               providerThreads: current.providerThreads.map((thread) => ({
                 ...thread,
-                goalWaitForPullRequest: { ...wait, resumeOnUpdate: false },
+                goalWait: { ...wait, resumeOnUpdate: false },
               })),
             });
           yield* input.session
@@ -1401,9 +1412,7 @@ effectIt.effect.each(["unwatch", "stalled", "failure"])(
       expect(startTurn).toHaveBeenCalledOnce();
       if (scenario === "unwatch") {
         expect(Exit.isSuccess(exit)).toBe(true);
-        expect(
-          startTurn.mock.calls[0]?.[0].providerThread.goalWaitForPullRequest?.resumeOnUpdate,
-        ).toBe(false);
+        expect(startTurn.mock.calls[0]?.[0].providerThread.goalWait?.resumeOnUpdate).toBe(false);
       } else {
         expect(Exit.isFailure(exit)).toBe(true);
         if (Exit.isFailure(exit)) {

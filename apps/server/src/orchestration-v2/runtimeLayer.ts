@@ -1,3 +1,4 @@
+import * as DelegatedTaskReadiness from "./DelegatedTaskReadiness.ts";
 import * as VcsProcess from "../vcs/VcsProcess.ts";
 import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
@@ -88,6 +89,8 @@ const layerStores = Layer.mergeAll(
   TurnItemPositionStore.layer,
 );
 
+const layerTaskReadiness = DelegatedTaskReadiness.layer.pipe(Layer.provide(layerStores));
+
 export const layerEventSink = EventSink.layerFromStores.pipe(Layer.provide(layerStores));
 const layerEventSinkProvided = layerEventSink;
 const layerProjectionMaintenanceProvided = ProjectionMaintenance.layer.pipe(
@@ -169,6 +172,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 );
 
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+  Layer.provide(layerTaskReadiness),
   Layer.provide(layerWorktreeProtection),
   Layer.provide(
     Layer.mergeAll(
@@ -219,6 +223,7 @@ const layerRunFinalizationServiceProvided = RunFinalizationService.layer.pipe(
 );
 
 const layerOrchestratorProvided = Orchestrator.layer.pipe(
+  Layer.provide(layerTaskReadiness),
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,

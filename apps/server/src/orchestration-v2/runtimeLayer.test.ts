@@ -2355,6 +2355,368 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect.each([
+    "pending",
+    "already-finished",
+    "restarting",
+    "acknowledged",
+    "stopped",
+    "recovery",
+  ])("task wait handles %s children without losing completion", (scenario) =>
+    Effect.gen(function* () {
+      const scoped = (id: string) => `${id}:${scenario}`;
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make(scoped("runtime-codex-task-wait"));
+      yield* seedProject({
+        projectId: ProjectId.make(scoped("goal-task-project")),
+        title: "Task wait",
+        workspaceRoot: `/tmp/t3-goal-task-wait/${scenario}`,
+        defaultModelSelection: modelSelection,
+        createdAt: "2026-10-24T19:00:00.000Z",
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make(scoped("goal-task-create")),
+        threadId,
+        projectId: ProjectId.make(scoped("goal-task-project")),
+        title: "Wait",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/t3-goal-task-wait",
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const now = yield* DateTime.now;
+      const providerThreadId = ProviderThreadId.make(scoped("provider-thread:goal-task"));
+      yield* sink.write({
+        commandId: CommandId.make(scoped("goal-task-seed")),
+        events: [
+          {
+            id: EventId.make(scoped("goal-task-provider")),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: providerThreadId,
+              driver: ProviderDriverKind.make("codex"),
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId: ProviderSessionId.make(scoped("goal-task-session")),
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              nativeConversationHeadRef: null,
+              status: "active",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              goal: { objective: "Ship the feature", status: "active" },
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          {
+            id: EventId.make(scoped("goal-task-turn")),
+            type: "provider-turn.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: ProviderTurnId.make(scoped("goal-task-turn")),
+              providerThreadId,
+              nodeId: NodeId.make(scoped("goal-task-node")),
+              runAttemptId: null,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+      const taskIds = [
+        NodeId.make(scoped("task:wait-alpha")),
+        NodeId.make(scoped("task:wait-beta")),
+      ];
+      const children = [];
+      for (const [index, taskId] of taskIds.entries()) {
+        const childId = ThreadId.make(scoped(`task-wait-child-${index}`));
+        yield* orchestrator.dispatch({
+          type: "thread.create",
+          commandId: CommandId.make(scoped(`task-child-create-${index}`)),
+          threadId: childId,
+          projectId: ProjectId.make(scoped("goal-task-project")),
+          title: "Child",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          branch: null,
+          worktreePath: null,
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(scoped(`task-child-message-${index}`)),
+          threadId: childId,
+          messageId: MessageId.make(scoped(`task-child-message-${index}`)),
+          text: "Do delegated work",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        const run = (yield* orchestrator.getThreadProjection(childId)).runs[0];
+        if (run === undefined) return yield* Effect.die("Missing child run");
+        const terminal = scenario === "already-finished" || scenario === "restarting";
+        const childRun = {
+          ...run,
+          delegatedTaskId: taskId,
+          status: terminal ? "completed" : "running",
+          startedAt: now,
+          completedAt: terminal ? now : null,
+        } satisfies OrchestrationV2Run;
+        yield* sink.write({
+          commandId: CommandId.make(scoped(`task-wait-seed-${index}`)),
+          events: [
+            {
+              id: EventId.make(scoped(`task-wait-run-${index}`)),
+              type: "run.updated",
+              threadId: childId,
+              runId: run.id,
+              occurredAt: now,
+              payload: childRun,
+            },
+            {
+              id: EventId.make(scoped(`task-wait-task-${index}`)),
+              type: "subagent.updated",
+              threadId,
+              occurredAt: now,
+              payload: {
+                id: taskId,
+                threadId,
+                runId: null,
+                parentNodeId: NodeId.make(scoped("goal-task-node")),
+                origin: "app_owned",
+                createdBy: "agent",
+                driver: ProviderDriverKind.make("codex"),
+                providerInstanceId: modelSelection.instanceId,
+                providerThreadId: null,
+                childThreadId: childId,
+                nativeTaskRef: null,
+                prompt: "Do delegated work",
+                title: "Child",
+                model: modelSelection.model,
+                status: "running",
+                result: null,
+                startedAt: now,
+                completedAt: null,
+                updatedAt: now,
+                completionDelivery: { state: "acknowledged", observedByRunId: null },
+              },
+            },
+          ],
+        });
+        if (scenario === "restarting")
+          yield* outbox.enqueue([
+            {
+              id: `effect:restart-continuation:${run.id}`,
+              commandId: CommandId.make(scoped(`task-restart-${index}`)),
+              threadId: childId,
+              request: { type: "provider-runtime.continue", sourceRunId: run.id },
+            },
+          ]);
+        children.push({ childId, run: childRun });
+      }
+      const arm = {
+        type: "provider-goal.wait-for-tasks",
+        commandId: CommandId.make(scoped("task-wait-arm")),
+        threadId,
+        providerInstanceId: modelSelection.instanceId,
+        taskIds,
+      } satisfies Parameters<typeof orchestrator.dispatch>[0];
+      yield* orchestrator.dispatch(arm);
+      yield* orchestrator.dispatch(arm);
+      const records = yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]);
+      const wait = records.providerThreads[0]?.goalWait;
+      if (scenario === "already-finished") {
+        assert.isUndefined(wait);
+        assert.deepEqual(yield* outbox.listByCommandId(arm.commandId), []);
+        return;
+      }
+      assert.equal(wait?.kind, "tasks");
+      if (wait?.kind !== "tasks") return yield* Effect.die("Expected task wait");
+      assert.deepEqual(wait.taskIds, taskIds);
+      assert.equal((yield* outbox.listByCommandId(arm.commandId)).length, 1);
+      const foreign = yield* Effect.flip(
+        orchestrator.dispatch({
+          ...arm,
+          commandId: CommandId.make(scoped("task-wait-foreign")),
+          taskIds: [NodeId.make(scoped("task:not-owned"))],
+        }),
+      );
+      assert.instanceOf(foreign, Orchestrator.OrchestratorDispatchError);
+      if (scenario === "stopped") {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(scoped("owner-start")),
+          threadId,
+          messageId: MessageId.make(scoped("owner-start")),
+          text: "Continue work",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "user",
+          creationSource: "web",
+        });
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make(scoped("owner-stop")),
+          threadId,
+        });
+        assert.isNull(
+          (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
+            ?.goalWait,
+        );
+        const stopped = yield* Effect.flip(
+          orchestrator.dispatch({ ...arm, commandId: CommandId.make(scoped("wait-after-stop")) }),
+        );
+        assert.instanceOf(stopped, Orchestrator.OrchestratorDispatchError);
+        return;
+      }
+      if (scenario === "acknowledged" || scenario === "recovery") {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make(scoped("bounded-notification")),
+          threadId,
+          messageId: MessageId.make(scoped("bounded-notification")),
+          text: "Process a task update",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          notification: {
+            source: { kind: "delegated_task", taskIds },
+            outcome: "updated",
+            summary: "Task update",
+          },
+        });
+        const parentRun = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0];
+        if (parentRun === undefined) return yield* Effect.die("Missing bounded parent run");
+        for (const [index, child] of children.entries()) {
+          yield* sink.write({
+            commandId: CommandId.make(scoped(`ack-child-finish-${index}`)),
+            events: [
+              {
+                id: EventId.make(scoped(`ack-child-finish-${index}`)),
+                type: "run.updated",
+                threadId: child.childId,
+                runId: child.run.id,
+                occurredAt: now,
+                payload: { ...child.run, status: "completed", completedAt: now },
+              },
+            ],
+          });
+        }
+        const readyMessageId = MessageId.make(`message:goal-tasks-ready:${wait.generation}`);
+        const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
+        const ready = yield* Deferred.make<void>();
+        yield* sink.stream({ threadId, afterSequence }).pipe(
+          Stream.runForEach((stored) =>
+            stored.event.type === "message.updated" && stored.event.payload.id === readyMessageId
+              ? Deferred.succeed(ready, undefined)
+              : Effect.void,
+          ),
+          Effect.forkScoped,
+        );
+        yield* Effect.yieldNow;
+        if (scenario === "recovery") {
+          yield* orchestrator.recoverDelegatedTasks;
+          yield* orchestrator.recoverDelegatedTasks;
+        } else
+          yield* sink.write({
+            commandId: CommandId.make(scoped("bounded-finish")),
+            events: [
+              {
+                id: EventId.make(scoped("bounded-finish")),
+                type: "run.updated",
+                threadId,
+                runId: parentRun.id,
+                occurredAt: now,
+                payload: { ...parentRun, status: "completed", completedAt: now },
+              },
+            ],
+          });
+        yield* Deferred.await(ready);
+        const messages = (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages;
+        assert.equal(messages.filter((message) => message.id === readyMessageId).length, 1);
+        return;
+      }
+      for (const [index, child] of children.entries()) {
+        yield* sink.write({
+          commandId: CommandId.make(scoped(`task-finish-${index}`)),
+          events: [
+            {
+              id: EventId.make(scoped(`task-finish-${index}`)),
+              type: "run.updated",
+              threadId: child.childId,
+              runId: child.run.id,
+              occurredAt: now,
+              payload: { ...child.run, status: "completed", completedAt: now },
+            },
+          ],
+        });
+        if (scenario === "restarting")
+          yield* outbox.cancelUnsettled({
+            threadId: child.childId,
+            effectTypes: ["provider-runtime.continue"],
+            reason: "Restart continuation settled",
+          });
+        const id = CommandId.make(scoped(`task-rewait-${index}`));
+        yield* orchestrator.dispatch({ ...arm, commandId: id });
+        if (index === 0) {
+          const updated = (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]))
+            .providerThreads[0]?.goalWait;
+          assert.deepEqual(updated?.kind === "tasks" ? updated.taskIds : [], taskIds.slice(1));
+        } else {
+          assert.deepEqual(
+            (yield* outbox.listByCommandId(id)).filter(
+              (effect) => effect.request.type === "provider-goal.wait",
+            ),
+            [],
+          );
+          const messages = (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages;
+          assert.isTrue(messages.some((m) => m.notification?.source.kind === "delegated_task"));
+        }
+      }
+      yield* orchestrator.dispatch({
+        type: "message.dispatch",
+        commandId: CommandId.make(scoped("task-wait-owner-pause")),
+        threadId,
+        messageId: MessageId.make(scoped("task-wait-owner-pause")),
+        text: "/goal pause",
+        attachments: [],
+        dispatchMode: { type: "queue_after_active" },
+        createdBy: "user",
+        creationSource: "web",
+      });
+      assert.isNull(
+        (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
+          ?.goalWait,
+      );
+      const late = yield* Effect.flip(
+        orchestrator.dispatch({
+          ...arm,
+          commandId: CommandId.make(scoped("task-wait-after-pause")),
+        }),
+      );
+      assert.instanceOf(late, Orchestrator.OrchestratorDispatchError);
+    }),
+  );
+
   it.effect("commits a Codex PR wait, preserves manual suspension, and honors goal controls", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
@@ -2444,14 +2806,14 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         waitForUpdate: true,
       });
       const records = yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]);
-      const wait = records.providerThreads[0]?.goalWaitForPullRequest;
+      const wait = records.providerThreads[0]?.goalWait;
       assert.isDefined(wait);
       if (wait == null) return yield* Effect.die("PR wait was not persisted");
       assert.deepEqual(
         (yield* outbox.listByCommandId(commandId)).map((entry) => entry.request),
         [
           {
-            type: "provider-goal.wait-for-pull-request",
+            type: "provider-goal.wait",
             providerSessionId: ProviderSessionId.make("goal-pr-session"),
             providerThreadId,
             providerTurnId: ProviderTurnId.make("goal-pr-turn"),
@@ -2470,14 +2832,14 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       const endedWait = { ...wait, resumeOnUpdate: false };
       assert.deepEqual(
         (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
-          ?.goalWaitForPullRequest,
+          ?.goalWait,
         endedWait,
       );
       assert.deepEqual(
         (yield* outbox.listByCommandId(unwatchId)).map((entry) => entry.request),
         [
           {
-            type: "provider-goal.wait-for-pull-request",
+            type: "provider-goal.wait",
             providerSessionId: ProviderSessionId.make("goal-pr-session"),
             providerThreadId,
             providerTurnId: ProviderTurnId.make("goal-pr-turn"),
@@ -2499,7 +2861,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         });
         assert.deepEqual(
           (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
-            ?.goalWaitForPullRequest,
+            ?.goalWait,
           control === "edit" ? endedWait : null,
         );
       }
@@ -2519,7 +2881,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       });
       assert.isNull(
         (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
-          ?.goalWaitForPullRequest,
+          ?.goalWait,
       );
     }),
   );

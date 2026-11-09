@@ -867,6 +867,7 @@ export const OrchestrationV2ProviderGoal = Schema.Struct({
   objective: TrimmedNonEmptyString,
   status: OrchestrationV2ProviderGoalStatus,
   waitingForPullRequest: Schema.optional(ThreadPullRequestKey),
+  waitingForTasks: Schema.optional(Schema.Array(NodeId)),
   tokensUsed: Schema.optional(NonNegativeInt),
   tokenBudget: Schema.optional(Schema.NullOr(NonNegativeInt)),
   timeUsedSeconds: Schema.optional(NonNegativeInt),
@@ -876,20 +877,35 @@ export const OrchestrationV2ProviderGoal = Schema.Struct({
 export type OrchestrationV2ProviderGoal = typeof OrchestrationV2ProviderGoal.Type;
 
 export const OrchestrationV2PullRequestGoalWait = Schema.Struct({
+  kind: Schema.optional(Schema.Literal("pull_request")),
   ...ThreadPullRequestKey.fields,
   startedAt: IsoDateTime,
   resumeOnUpdate: Schema.optional(Schema.Boolean),
 });
 export type OrchestrationV2PullRequestGoalWait = typeof OrchestrationV2PullRequestGoalWait.Type;
 
-export const OrchestrationV2PullRequestGoalWaitChange = Schema.Struct({
-  wait: Schema.NullOr(OrchestrationV2PullRequestGoalWait),
-  expected: Schema.optional(OrchestrationV2PullRequestGoalWait),
+export const OrchestrationV2TaskGoalWait = Schema.Struct({
+  kind: Schema.Literal("tasks"),
+  generation: CommandId,
+  taskIds: Schema.Array(NodeId).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+  startedAt: IsoDateTime,
+  resumeOnUpdate: Schema.optional(Schema.Boolean),
 });
-export type OrchestrationV2PullRequestGoalWaitChange =
-  typeof OrchestrationV2PullRequestGoalWaitChange.Type;
+export type OrchestrationV2TaskGoalWait = typeof OrchestrationV2TaskGoalWait.Type;
+export const OrchestrationV2GoalWait = Schema.Union([
+  OrchestrationV2TaskGoalWait,
+  OrchestrationV2PullRequestGoalWait,
+]);
+export type OrchestrationV2GoalWait = typeof OrchestrationV2GoalWait.Type;
+
+export const OrchestrationV2GoalWaitChange = Schema.Struct({
+  wait: Schema.NullOr(OrchestrationV2GoalWait),
+  expected: Schema.optional(OrchestrationV2GoalWait),
+});
+export type OrchestrationV2GoalWaitChange = typeof OrchestrationV2GoalWaitChange.Type;
 
 export const OrchestrationV2ProviderThread = Schema.Struct({
+  goalWait: Schema.optional(Schema.NullOr(OrchestrationV2GoalWait)),
   goalWaitForPullRequest: Schema.optional(Schema.NullOr(OrchestrationV2PullRequestGoalWait)),
   id: ProviderThreadId,
   driver: ProviderDriverKind,
@@ -1701,7 +1717,7 @@ export const OrchestrationV2DomainEvent = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2EventBase.fields,
     type: Schema.Literal("provider-thread.updated"),
-    goalWaitChange: Schema.optional(OrchestrationV2PullRequestGoalWaitChange),
+    goalWaitChange: Schema.optional(OrchestrationV2GoalWaitChange),
     payload: OrchestrationV2ProviderThread,
   }),
   Schema.Struct({
@@ -2512,7 +2528,7 @@ export const OrchestrationV2DomainEventJson = Schema.Union([
   Schema.Struct({
     ...OrchestrationV2JsonEventBaseFields,
     type: Schema.Literal("provider-thread.updated"),
-    goalWaitChange: Schema.optional(OrchestrationV2PullRequestGoalWaitChange),
+    goalWaitChange: Schema.optional(OrchestrationV2GoalWaitChange),
     payload: OrchestrationV2ProviderThreadJson,
   }),
   Schema.Struct({
@@ -3029,6 +3045,13 @@ export type OrchestrationV2Command = typeof OrchestrationV2Command.Type;
  * send them.
  */
 const OrchestrationV2InternalCommand = Schema.Union([
+  Schema.Struct({
+    type: Schema.Literal("provider-goal.wait-for-tasks"),
+    commandId: CommandId,
+    threadId: ThreadId,
+    providerInstanceId: ProviderInstanceId,
+    taskIds: Schema.Array(NodeId).check(Schema.isMinLength(1), Schema.isMaxLength(32)),
+  }),
   Schema.Struct({
     type: Schema.Literal("thread.pull-request-watch.sync"),
     commandId: CommandId,

@@ -1,3 +1,4 @@
+import * as DelegatedTaskReadiness from "./DelegatedTaskReadiness.ts";
 import { modelSelectionsEqual } from "@t3tools/shared/model";
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
@@ -111,6 +112,7 @@ export const layer: Layer.Layer<
   | WorktreeProtection.WorktreeProtection
   | ProjectService.ProjectService
   | ProviderAuthService.ProviderAuthService
+  | DelegatedTaskReadiness.DelegatedTaskReadiness
   | ProjectionStore.ProjectionStoreV2
   | ProviderSessionManager.ProviderSessionManagerV2
   | RunExecutionService.RunExecutionServiceV2
@@ -127,6 +129,7 @@ export const layer: Layer.Layer<
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const taskReadiness = yield* DelegatedTaskReadiness.DelegatedTaskReadiness;
     const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
@@ -200,10 +203,7 @@ export const layer: Layer.Layer<
       session: ProviderAdapter.ProviderAdapterV2SessionRuntime,
       input: ProviderAdapter.ProviderAdapterV2TurnInput,
     ) {
-      if (
-        input.providerThread.driver !== "codex" ||
-        input.providerThread.goalWaitForPullRequest == null
-      ) {
+      if (input.providerThread.driver !== "codex" || input.providerThread.goalWait == null) {
         return yield* session.startTurn(input);
       }
       // A wake must read its wait and activate under the same lock as unwatch/Stop.
@@ -214,6 +214,7 @@ export const layer: Layer.Layer<
           Effect.gen(function* () {
             const records = yield* projectionStore.getThreadRecords(input.threadId, [
               "providerThreads",
+              "subagents",
             ]);
             const providerThread = records.providerThreads.find(
               (thread) => thread.id === input.providerThread.id,
@@ -226,7 +227,18 @@ export const layer: Layer.Layer<
                 runId: input.runId,
                 cause: "Provider thread disappeared before its goal could resume.",
               });
-            yield* session.startTurn({ ...input, providerThread });
+            const wait = providerThread.goalWait;
+            const pendingTasks =
+              wait?.kind === "tasks"
+                ? yield* Effect.forEach(wait.taskIds, (id) => {
+                    const task = records.subagents.find((task) => task.id === id);
+                    return task?.childThreadId == null
+                      ? Effect.succeed(true)
+                      : taskReadiness.pending(task.childThreadId, id);
+                  })
+                : [];
+            const goalWaitReady = wait?.kind === "tasks" && !pendingTasks.includes(true);
+            yield* session.startTurn({ ...input, providerThread, goalWaitReady });
           }).pipe(Effect.timeout("15 seconds")),
         )
         .pipe(
@@ -1282,7 +1294,7 @@ export const layer: Layer.Layer<
           ? session
           : makeDeliverySession(session, startWithHandoffs);
       const deliverySession =
-        baseDeliverySession === session && runningProviderThread.goalWaitForPullRequest != null
+        baseDeliverySession === session && runningProviderThread.goalWait != null
           ? {
               ...session,
               startTurn: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
@@ -1325,6 +1337,9 @@ export const layer: Layer.Layer<
         message: {
           messageId: message.id,
           ...(message.notification === undefined ? {} : { notification: message.notification }),
+          ...(message.delegatedCompletion === undefined
+            ? {}
+            : { delegatedCompletion: message.delegatedCompletion }),
           text: userText,
           attachments: message.attachments,
           createdBy: message.createdBy,

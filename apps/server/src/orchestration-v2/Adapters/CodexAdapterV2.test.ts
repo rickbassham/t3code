@@ -15,6 +15,7 @@ import {
   type ModelSelection,
   NodeId,
   type OrchestrationV2AppThread,
+  type OrchestrationV2GoalWait,
   type OrchestrationV2ProviderThread,
   type OrchestrationV2ProviderTurn,
   type OrchestrationV2RuntimeRequest,
@@ -9329,84 +9330,95 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.isNull(CodexAdapterV2.parseCodexGoalCommand("set a /goal"));
     });
 
-    it.effect("releases a goal run when it explicitly waits for a pull request", () =>
-      Effect.gen(function* () {
-        const wait = {
-          host: "github.com",
-          repository: "owner/repo",
-          number: 414,
-          startedAt: "2026-10-23T21:00:00.000Z",
-        };
-        const transcript = makeCodexReplayTranscript({
-          scenario: "goal-pr-wait",
-          entries: [
-            ...sessionStart,
-            ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal: null }),
-            ...request(
-              4,
-              "thread/goal/set",
-              {
+    it.effect.each(["PR", "tasks"])(
+      "releases a goal run when it explicitly waits for %s",
+      (scenario) =>
+        Effect.gen(function* () {
+          const wait = {
+            host: "github.com",
+            repository: "owner/repo",
+            number: 414,
+            startedAt: "2026-10-23T21:00:00.000Z",
+          };
+          const goalWait =
+            scenario === "tasks"
+              ? ({
+                  kind: "tasks",
+                  generation: CommandId.make("explicit-task-wait"),
+                  taskIds: [NodeId.make("task:work")],
+                  startedAt: wait.startedAt,
+                } satisfies OrchestrationV2GoalWait)
+              : wait;
+          const transcript = makeCodexReplayTranscript({
+            scenario: "goal-pr-wait",
+            entries: [
+              ...sessionStart,
+              ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal: null }),
+              ...request(
+                4,
+                "thread/goal/set",
+                {
+                  threadId: nativeThreadId,
+                  objective,
+                  status: "paused",
+                },
+                { goal: codexGoal("paused", 0) },
+              ),
+              ...withReplayRequestId(
+                codexReplayPreamble({
+                  nativeThreadId,
+                  nativeTurnId: "goal-wait-turn",
+                  prompt: objective,
+                }).slice(5),
+                5,
+              ),
+              ...request(
+                6,
+                "thread/goal/set",
+                {
+                  threadId: nativeThreadId,
+                  status: "active",
+                },
+                { goal: codexGoal("active", 0) },
+              ),
+              ...request(
+                7,
+                "thread/goal/set",
+                {
+                  threadId: nativeThreadId,
+                  status: "paused",
+                },
+                { goal: codexGoal("paused", 1200) },
+              ),
+              notification("waiting turn done", "turn/completed", {
                 threadId: nativeThreadId,
-                objective,
-                status: "paused",
-              },
-              { goal: codexGoal("paused", 0) },
-            ),
-            ...withReplayRequestId(
-              codexReplayPreamble({
-                nativeThreadId,
-                nativeTurnId: "goal-wait-turn",
-                prompt: objective,
-              }).slice(5),
-              5,
-            ),
-            ...request(
-              6,
-              "thread/goal/set",
-              {
-                threadId: nativeThreadId,
-                status: "active",
-              },
-              { goal: codexGoal("active", 0) },
-            ),
-            ...request(
-              7,
-              "thread/goal/set",
-              {
-                threadId: nativeThreadId,
-                status: "paused",
-              },
-              { goal: codexGoal("paused", 1200) },
-            ),
-            notification("waiting turn done", "turn/completed", {
-              threadId: nativeThreadId,
-              turn: makeCodexReplayTurn({ id: "goal-wait-turn", status: "completed" }),
+                turn: makeCodexReplayTurn({ id: "goal-wait-turn", status: "completed" }),
+              }),
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          yield* harness.runtime.startTurn(yield* goalTurnInput(harness, `/goal ${objective}`));
+          assert.isDefined(harness.runtime.waitForGoal);
+          const allocator = yield* IdAllocator.IdAllocatorV2;
+          yield* harness.runtime.waitForGoal!({
+            providerTurnId: allocator.derive.providerTurn({
+              driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+              nativeTurnId: "goal-wait-turn",
             }),
-          ],
-        });
-        const harness = yield* makeCodexReplayHarness(transcript);
-        yield* harness.runtime.startTurn(yield* goalTurnInput(harness, `/goal ${objective}`));
-        assert.isDefined(harness.runtime.waitForPullRequest);
-        const allocator = yield* IdAllocator.IdAllocatorV2;
-        yield* harness.runtime.waitForPullRequest!({
-          providerTurnId: allocator.derive.providerTurn({
-            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
-            nativeTurnId: "goal-wait-turn",
-          }),
-          providerThread: { ...harness.providerThread, goalWaitForPullRequest: wait },
-        });
-        yield* harness.firstTerminal;
-        assert.deepEqual(
-          harness.terminalEvents().map((event) => event.status),
-          ["completed"],
-        );
-        assert.equal(providerGoals(harness.events).at(-1), "paused");
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(
-          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+            providerThread: { ...harness.providerThread, goalWait },
+          });
+          yield* harness.firstTerminal;
+          assert.deepEqual(
+            harness.terminalEvents().map((event) => event.status),
+            ["completed"],
+          );
+          assert.equal(providerGoals(harness.events).at(-1), "paused");
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
         ),
-      ),
     );
 
     it.effect("replaces a cached cleared wait with the projection's new wait", () =>
@@ -9450,16 +9462,16 @@ describe("CodexAdapterV2 post-settle continuation", () => {
         const show = yield* goalTurnInput(harness, "/goal");
         yield* harness.runtime.startTurn({
           ...show,
-          providerThread: { ...show.providerThread, goalWaitForPullRequest: null },
+          providerThread: { ...show.providerThread, goalWait: null },
         });
         yield* harness.firstTerminal;
         capture = true;
         const input = yield* goalTurnInput(harness, prompt);
         yield* harness.runtime.startTurn({
           ...input,
-          providerThread: { ...input.providerThread, goalWaitForPullRequest: wait },
+          providerThread: { ...input.providerThread, goalWait: wait },
         });
-        assert.deepEqual((yield* Deferred.await(updated)).goalWaitForPullRequest, wait);
+        assert.deepEqual((yield* Deferred.await(updated)).goalWait, wait);
       }).pipe(
         Effect.scoped,
         Effect.provide(
@@ -9468,265 +9480,317 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
     );
 
-    it.effect("processes background completion during a PR wait, then resumes for CI", () =>
-      Effect.gen(function* () {
-        const wait = {
-          host: "github.com",
-          repository: "owner/repo",
-          number: 416,
-          startedAt: "2026-10-24T05:29:39.000Z",
-        };
-        const prompt = "Background command completed: llmlint r1, exit 1.";
-        const ciPrompt = "All required checks passed on PR 416.";
-        const waitContext = CodexAdapterV2.buildCodexGoalContext({
-          objective,
-          status: "active",
-          waitingForPullRequest: wait,
-        });
-        const transcript = makeCodexReplayTranscript({
-          scenario: "goal-pr-wait-background-completion",
-          entries: [
-            ...withCodexGoalContext(
-              codexReplayPreamble({ nativeThreadId, nativeTurnId: "lint-turn", prompt }),
-              waitContext,
-            ),
-            notification("goal still waiting", "thread/goal/updated", {
-              threadId: nativeThreadId,
-              turnId: "lint-turn",
-              goal: codexGoal("paused", 1200),
-            }),
-            notification("lint turn done", "turn/completed", {
-              threadId: nativeThreadId,
-              turn: makeCodexReplayTurn({ id: "lint-turn", status: "completed" }),
-            }),
-            ...request(
-              4,
-              "thread/goal/get",
-              { threadId: nativeThreadId },
-              {
-                goal: codexGoal("paused", 1200),
-              },
-            ),
-            ...withReplayRequestId(
-              codexReplayPreamble({
-                nativeThreadId,
-                nativeTurnId: "ci-turn",
-                prompt: ciPrompt,
-              }).slice(5),
-              5,
-            ),
-            ...request(
-              6,
-              "thread/goal/set",
-              { threadId: nativeThreadId, status: "active" },
-              {
-                goal: codexGoal("active", 1200),
-              },
-            ),
-            notification("goal done", "thread/goal/updated", {
-              threadId: nativeThreadId,
-              turnId: "ci-turn",
-              goal: codexGoal("complete", 1500),
-            }),
-            notification("ci turn done", "turn/completed", {
-              threadId: nativeThreadId,
-              turn: makeCodexReplayTurn({ id: "ci-turn", status: "completed" }),
-            }),
-          ],
-        });
-        const starts: Array<unknown> = [];
-        const secondTerminal = yield* Deferred.make<void>();
-        let terminalCount = 0;
-        const harness = yield* makeCodexReplayHarness(
-          transcript,
-          (event) => {
-            if (event.type === "turn.terminal" && ++terminalCount === 2) {
-              return Deferred.succeed(secondTerminal, undefined);
-            }
-            return Effect.void;
-          },
-          (method, params) =>
-            Effect.sync(() => {
-              if (method === "turn/start") starts.push(params);
-            }),
-        );
-        const input = yield* goalTurnInput(harness, prompt);
-        const providerThread = {
-          ...input.providerThread,
-          goal: { objective, status: "paused" },
-          goalWaitForPullRequest: wait,
-        } satisfies OrchestrationV2ProviderThread;
-        const appThread = {
-          ...input.appThread,
-          pullRequests: [
-            {
-              host: wait.host,
-              repository: wait.repository,
-              number: wait.number,
-              url: "https://github.com/owner/repo/pull/416",
-              source: "agent",
-              linkedAt: wait.startedAt,
-              snapshot: null,
-              stack: null,
-              watch: {
+    it.effect.each(["PR", "tasks-background", "tasks-partial", "tasks-question"])(
+      "processes a bounded notification during %s wait, then resumes when ready",
+      (scenario) =>
+        Effect.gen(function* () {
+          const wait = {
+            host: "github.com",
+            repository: "owner/repo",
+            number: 416,
+            startedAt: "2026-10-24T05:29:39.000Z",
+          };
+          const isTaskWait = scenario !== "PR";
+          const taskIds = [NodeId.make("task:alpha"), NodeId.make("task:beta")];
+          const goalWait = isTaskWait
+            ? ({
+                kind: "tasks",
+                generation: CommandId.make("task-wait-generation"),
+                taskIds,
                 startedAt: wait.startedAt,
-                headSha: null,
-                failedChecks: [],
-                passed: false,
-                passedChecks: [],
-                remarksThrough: wait.startedAt,
-                remarkIds: [],
-                conflicting: false,
-                wakes: 0,
-              },
+              } satisfies OrchestrationV2GoalWait)
+            : wait;
+          const prompt = "Background command completed: llmlint r1, exit 1.";
+          const ciPrompt = "All required checks passed on PR 416.";
+          const waitContext = CodexAdapterV2.buildCodexGoalContext({
+            objective,
+            status: "active",
+            ...(isTaskWait ? { waitingForTasks: taskIds } : { waitingForPullRequest: wait }),
+          });
+          const transcript = makeCodexReplayTranscript({
+            scenario: "goal-pr-wait-background-completion",
+            entries: [
+              ...withCodexGoalContext(
+                codexReplayPreamble({ nativeThreadId, nativeTurnId: "lint-turn", prompt }),
+                waitContext,
+              ),
+              notification("goal still waiting", "thread/goal/updated", {
+                threadId: nativeThreadId,
+                turnId: "lint-turn",
+                goal: codexGoal("paused", 1200),
+              }),
+              notification("lint turn done", "turn/completed", {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: "lint-turn", status: "completed" }),
+              }),
+              ...request(
+                4,
+                "thread/goal/get",
+                { threadId: nativeThreadId },
+                {
+                  goal: codexGoal("paused", 1200),
+                },
+              ),
+              ...withReplayRequestId(
+                codexReplayPreamble({
+                  nativeThreadId,
+                  nativeTurnId: "ci-turn",
+                  prompt: ciPrompt,
+                }).slice(5),
+                5,
+              ),
+              ...request(
+                6,
+                "thread/goal/set",
+                { threadId: nativeThreadId, status: "active" },
+                {
+                  goal: codexGoal("active", 1200),
+                },
+              ),
+              notification("goal done", "thread/goal/updated", {
+                threadId: nativeThreadId,
+                turnId: "ci-turn",
+                goal: codexGoal("complete", 1500),
+              }),
+              notification("ci turn done", "turn/completed", {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: "ci-turn", status: "completed" }),
+              }),
+            ],
+          });
+          const starts: Array<unknown> = [];
+          const secondTerminal = yield* Deferred.make<void>();
+          let terminalCount = 0;
+          const harness = yield* makeCodexReplayHarness(
+            transcript,
+            (event) => {
+              if (event.type === "turn.terminal" && ++terminalCount === 2) {
+                return Deferred.succeed(secondTerminal, undefined);
+              }
+              return Effect.void;
             },
-          ],
-        } satisfies OrchestrationV2AppThread;
-        yield* harness.runtime.startTurn({
-          ...input,
-          appThread,
-          providerThread,
-          message: {
-            ...input.message,
-            notification: {
-              source: { kind: "command" },
-              outcome: "failed",
-              summary: "llmlint r1 finished",
-            },
-          },
-        });
-        yield* harness.firstTerminal;
-        assert.lengthOf(starts, 1);
-        assert.deepNestedPropertyVal(
-          starts[0],
-          "additionalContext.t3_code_goal",
-          waitContext.t3_code_goal,
-        );
-        assert.include(JSON.stringify(starts[0]), prompt);
-        assert.equal(harness.continuationRequests.length, 0);
-        const updates = harness.events.filter((e) => e.type === "provider_thread.updated");
-        assert.deepEqual(updates.at(-1)?.providerThread.goalWaitForPullRequest, wait);
-        assert.equal(updates.at(-1)?.providerThread.goal?.status, "paused");
-        const ciInput = yield* goalTurnInput(harness, ciPrompt);
-        yield* harness.runtime.startTurn({
-          ...ciInput,
-          appThread,
-          providerThread,
-          message: {
-            ...ciInput.message,
-            notification: {
-              source: { kind: "monitor", pullRequest: wait },
-              outcome: "completed",
-              summary: "Checks passed",
-            },
-          },
-        });
-        yield* Deferred.await(secondTerminal);
-        assert.lengthOf(starts, 2);
-        assert.deepNestedPropertyVal(
-          starts[1],
-          "additionalContext.t3_code_goal",
-          CodexAdapterV2.buildCodexGoalContext(null).t3_code_goal,
-        );
-        assert.equal(providerGoals(harness.events).at(-1), "complete");
-        assert.isNull(
-          harness.events.findLast((e) => e.type === "provider_thread.updated")?.providerThread
-            .goalWaitForPullRequest,
-        );
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(
-          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
-        ),
-      ),
-    );
-
-    it.effect("resumes a persisted PR wait with the notification text", () =>
-      Effect.gen(function* () {
-        const wait = {
-          host: "github.com",
-          repository: "owner/repo",
-          number: 414,
-          startedAt: "2026-10-23T21:00:00.000Z",
-        };
-        const prompt = "All required checks passed on PR 414.";
-        const transcript = makeCodexReplayTranscript({
-          scenario: "goal-pr-wake",
-          entries: [
-            ...sessionStart,
-            ...request(
-              3,
-              "thread/goal/get",
-              { threadId: nativeThreadId },
-              { goal: codexGoal("paused", 1200) },
-            ),
-            ...withReplayRequestId(
-              codexReplayPreamble({
-                nativeThreadId,
-                nativeTurnId: "goal-wake-turn",
-                prompt,
-              }).slice(5),
-              4,
-            ),
-            ...request(
-              5,
-              "thread/goal/set",
-              { threadId: nativeThreadId, status: "active" },
-              { goal: codexGoal("active", 1200) },
-            ),
-            notification("goal done", "thread/goal/updated", {
-              threadId: nativeThreadId,
-              turnId: "goal-wake-turn",
-              goal: codexGoal("complete", 1500),
-            }),
-            notification("wake turn done", "turn/completed", {
-              threadId: nativeThreadId,
-              turn: makeCodexReplayTurn({ id: "goal-wake-turn", status: "completed" }),
-            }),
-          ],
-        });
-        const starts: Array<unknown> = [];
-        const harness = yield* makeCodexReplayHarness(
-          transcript,
-          () => Effect.void,
-          (method, params) =>
-            Effect.sync(() => {
-              if (method === "turn/start") starts.push(params);
-            }),
-        );
-        const input = yield* goalTurnInput(harness, prompt);
-        yield* harness.runtime.startTurn({
-          ...input,
-          providerThread: {
+            (method, params) =>
+              Effect.sync(() => {
+                if (method === "turn/start") starts.push(params);
+              }),
+          );
+          const input = yield* goalTurnInput(harness, prompt);
+          const providerThread = {
             ...input.providerThread,
             goal: { objective, status: "paused" },
-            goalWaitForPullRequest: wait,
-          },
-          message: {
-            ...input.message,
-            notification: {
-              source: { kind: "monitor", pullRequest: wait },
-              outcome: "completed",
-              summary: "Checks passed",
+            goalWait,
+          } satisfies OrchestrationV2ProviderThread;
+          const appThread = {
+            ...input.appThread,
+            pullRequests: [
+              {
+                host: wait.host,
+                repository: wait.repository,
+                number: wait.number,
+                url: "https://github.com/owner/repo/pull/416",
+                source: "agent",
+                linkedAt: wait.startedAt,
+                snapshot: null,
+                stack: null,
+                watch: {
+                  startedAt: wait.startedAt,
+                  headSha: null,
+                  failedChecks: [],
+                  passed: false,
+                  passedChecks: [],
+                  remarksThrough: wait.startedAt,
+                  remarkIds: [],
+                  conflicting: false,
+                  wakes: 0,
+                },
+              },
+            ],
+          } satisfies OrchestrationV2AppThread;
+          yield* harness.runtime.startTurn({
+            ...input,
+            appThread,
+            providerThread,
+            goalWaitReady: false,
+            message: {
+              ...input.message,
+              ...(scenario === "tasks-partial"
+                ? {
+                    delegatedCompletion: {
+                      parentRunId: input.runId,
+                      generation: 1,
+                      taskIds: [taskIds[0]!],
+                    },
+                  }
+                : {}),
+              notification: {
+                source:
+                  scenario === "tasks-question"
+                    ? { kind: "delegated_task", taskIds: [taskIds[0]!] }
+                    : { kind: "command" },
+                outcome: "updated",
+                summary: "llmlint r1 finished",
+              },
             },
-          },
-        });
-        yield* harness.firstTerminal;
-        assert.lengthOf(starts, 1);
-        assert.deepNestedPropertyVal(
-          starts[0],
-          "additionalContext.t3_code_goal",
-          CodexAdapterV2.buildCodexGoalContext(null).t3_code_goal,
-        );
-        assert.equal(providerGoals(harness.events).at(-1), "complete");
-        const updates = harness.events.filter((event) => event.type === "provider_thread.updated");
-        assert.isNull(updates.at(-1)?.providerThread.goalWaitForPullRequest);
-      }).pipe(
-        Effect.scoped,
-        Effect.provide(
-          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          });
+          yield* harness.firstTerminal;
+          assert.lengthOf(starts, 1);
+          assert.deepNestedPropertyVal(
+            starts[0],
+            "additionalContext.t3_code_goal",
+            waitContext.t3_code_goal,
+          );
+          assert.include(JSON.stringify(starts[0]), prompt);
+          assert.equal(harness.continuationRequests.length, 0);
+          const updates = harness.events.filter((e) => e.type === "provider_thread.updated");
+          assert.deepEqual(updates.at(-1)?.providerThread.goalWait, goalWait);
+          assert.equal(updates.at(-1)?.providerThread.goal?.status, "paused");
+          const ciInput = yield* goalTurnInput(harness, ciPrompt);
+          yield* harness.runtime.startTurn({
+            ...ciInput,
+            appThread,
+            providerThread,
+            goalWaitReady: isTaskWait,
+            message: {
+              ...ciInput.message,
+              ...(isTaskWait
+                ? {
+                    delegatedCompletion: {
+                      parentRunId: input.runId,
+                      generation: 2,
+                      taskIds: [taskIds[1]!],
+                    },
+                  }
+                : {
+                    notification: {
+                      source: { kind: "monitor", pullRequest: wait },
+                      outcome: "completed",
+                      summary: "Checks passed",
+                    },
+                  }),
+            },
+          });
+          yield* Deferred.await(secondTerminal);
+          assert.lengthOf(starts, 2);
+          assert.deepNestedPropertyVal(
+            starts[1],
+            "additionalContext.t3_code_goal",
+            CodexAdapterV2.buildCodexGoalContext(null).t3_code_goal,
+          );
+          assert.equal(providerGoals(harness.events).at(-1), "complete");
+          assert.isNull(
+            harness.events.findLast((e) => e.type === "provider_thread.updated")?.providerThread
+              .goalWait,
+          );
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
         ),
-      ),
+    );
+
+    it.effect.each(["pull_request", "tasks"])(
+      "resumes a persisted %s wait with the notification text",
+      (kind) =>
+        Effect.gen(function* () {
+          const wait = {
+            host: "github.com",
+            repository: "owner/repo",
+            number: 414,
+            startedAt: "2026-10-23T21:00:00.000Z",
+          };
+          const prompt = "All required checks passed on PR 414.";
+          const transcript = makeCodexReplayTranscript({
+            scenario: "goal-pr-wake",
+            entries: [
+              ...sessionStart,
+              ...request(
+                3,
+                "thread/goal/get",
+                { threadId: nativeThreadId },
+                { goal: codexGoal("paused", 1200) },
+              ),
+              ...withReplayRequestId(
+                codexReplayPreamble({
+                  nativeThreadId,
+                  nativeTurnId: "goal-wake-turn",
+                  prompt,
+                }).slice(5),
+                4,
+              ),
+              ...request(
+                5,
+                "thread/goal/set",
+                { threadId: nativeThreadId, status: "active" },
+                { goal: codexGoal("active", 1200) },
+              ),
+              notification("goal done", "thread/goal/updated", {
+                threadId: nativeThreadId,
+                turnId: "goal-wake-turn",
+                goal: codexGoal("complete", 1500),
+              }),
+              notification("wake turn done", "turn/completed", {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: "goal-wake-turn", status: "completed" }),
+              }),
+            ],
+          });
+          const starts: Array<unknown> = [];
+          const harness = yield* makeCodexReplayHarness(
+            transcript,
+            () => Effect.void,
+            (method, params) =>
+              Effect.sync(() => {
+                if (method === "turn/start") starts.push(params);
+              }),
+          );
+          const input = yield* goalTurnInput(harness, prompt);
+          yield* harness.runtime.startTurn({
+            ...input,
+            goalWaitReady: kind === "tasks",
+            providerThread: {
+              ...input.providerThread,
+              goal: { objective, status: "paused" },
+              goalWait:
+                kind === "tasks"
+                  ? {
+                      kind: "tasks",
+                      generation: CommandId.make("cold-task-wait"),
+                      taskIds: [NodeId.make("cold-task")],
+                      startedAt: wait.startedAt,
+                    }
+                  : wait,
+            },
+            message: {
+              ...input.message,
+              notification: {
+                source:
+                  kind === "tasks"
+                    ? { kind: "delegated_task", taskIds: [NodeId.make("cold-task")] }
+                    : { kind: "monitor", pullRequest: wait },
+                outcome: "completed",
+                summary: "Checks passed",
+              },
+            },
+          });
+          yield* harness.firstTerminal;
+          assert.lengthOf(starts, 1);
+          assert.deepNestedPropertyVal(
+            starts[0],
+            "additionalContext.t3_code_goal",
+            CodexAdapterV2.buildCodexGoalContext(null).t3_code_goal,
+          );
+          assert.equal(providerGoals(harness.events).at(-1), "complete");
+          const updates = harness.events.filter(
+            (event) => event.type === "provider_thread.updated",
+          );
+          assert.isNull(updates.at(-1)?.providerThread.goalWait);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
     );
 
     it.effect.each(["active", "paused", "complete"] as const)(
@@ -9773,13 +9837,13 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           const resumed = yield* harness.runtime.resumeThread({
             providerThread: {
               ...harness.providerThread,
-              goalWaitForPullRequest: wait,
+              goalWait: wait,
               goal: { objective, status: "paused" },
             },
             modelSelection: CODEX_TEST_MODEL_SELECTION,
             runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
           });
-          assert.deepEqual(resumed.goalWaitForPullRequest, wait);
+          assert.deepEqual(resumed.goalWait, wait);
         }).pipe(
           Effect.scoped,
           Effect.provide(
@@ -9828,7 +9892,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             providerThread: {
               ...input.providerThread,
               goal: { objective, status: "paused" },
-              goalWaitForPullRequest:
+              goalWait:
                 scenario === "manual-pause"
                   ? null
                   : scenario === "ended-watch"
@@ -10015,7 +10079,7 @@ describe("CodexAdapterV2 post-settle continuation", () => {
           providerThread: {
             ...input.providerThread,
             goal: { objective, status: "paused" },
-            goalWaitForPullRequest: wait,
+            goalWait: wait,
           },
         });
         yield* harness.firstTerminal;

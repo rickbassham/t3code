@@ -748,6 +748,26 @@ describe("presentProviderGoal", () => {
     }
   });
 
+  it("shows automatic task waits without offering manual resume", () => {
+    const goal = {
+      objective: "Deliver the issue",
+      status: "active",
+      waitingForTasks: [NodeId.make("task:a"), NodeId.make("task:b")],
+    } satisfies Parameters<typeof presentProviderGoal>[0];
+    expect(presentProviderGoal(goal, false)).toMatchObject({
+      title: "Waiting for 2 tasks",
+      canResume: false,
+    });
+    expect(presentProviderGoal({ ...goal, status: "paused" }, false).canResume).toBe(false);
+    expect(
+      presentProviderGoal({ ...goal, waitingForTasks: [NodeId.make("task:a")] }, false).title,
+    ).toBe("Waiting for 1 task");
+    expect(
+      presentProviderGoal({ objective: goal.objective, status: "paused" }, false).canResume,
+    ).toBe(true);
+    expect(presentProviderGoal({ ...goal, status: "blocked" }, false).canResume).toBe(true);
+  });
+
   it("summarizes Codex accounting and offers resume once the goal stops short", () => {
     expect(
       presentProviderGoal(

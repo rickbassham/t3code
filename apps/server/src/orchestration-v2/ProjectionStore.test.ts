@@ -3272,7 +3272,7 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
         suffix: string,
         goal: OrchestrationV2ProviderThread["goal"],
         seconds: number,
-        wait?: OrchestrationV2ProviderThread["goalWaitForPullRequest"],
+        wait?: OrchestrationV2ProviderThread["goalWait"],
       ) =>
         projectionStore.apply({
           id: EventId.make(`event:provider-goal:${suffix}:${seconds}`),
@@ -7131,7 +7131,7 @@ it.effect.each([
   ["SQL", layerTest],
 ] as const)(
   "%s preserves a PR goal wait through native updates and clears it explicitly",
-  ([, layer]) =>
+  ([backend, layer]) =>
     Effect.gen(function* () {
       const store = yield* ProjectionStore.ProjectionStoreV2;
       const threadId = yield* addRolledBackRecoveryCandidate("goal-pr-wait");
@@ -7160,7 +7160,7 @@ it.effect.each([
         startedAt: "2026-10-23T21:00:00.000Z",
       };
       for (const [name, payload] of [
-        ["wait", { ...providerThread, goalWaitForPullRequest: wait }],
+        ["wait", { ...providerThread, goalWait: wait }],
         ["usage", providerThread],
       ] as const) {
         yield* store.apply({
@@ -7173,9 +7173,35 @@ it.effect.each([
         });
       }
       assert.deepEqual(
-        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWait,
         wait,
       );
+      if (backend === "SQL") {
+        const sql = yield* Effect.serviceOption(SqlClient.SqlClient).pipe(
+          Effect.flatMap((option) =>
+            option._tag === "Some"
+              ? Effect.succeed(option.value)
+              : Effect.die("SQL test backend missing"),
+          ),
+        );
+        const legacyPayload = yield* ProjectionStore.encodeProviderThreadPayload({
+          ...providerThread,
+          goalWaitForPullRequest: wait,
+        });
+        yield* sql`UPDATE orchestration_v2_projection_provider_threads
+          SET payload_json = ${legacyPayload} WHERE provider_thread_id = ${providerThread.id}`;
+        yield* store.apply({
+          id: EventId.make("event:goal-pr-wait:legacy-native-update"),
+          type: "provider-thread.updated",
+          threadId,
+          occurredAt: now,
+          payload: providerThread,
+        });
+        const recovered = (yield* store.getThreadRecords(threadId, ["providerThreads"]))
+          .providerThreads[0];
+        assert.deepEqual(recovered?.goalWait, wait);
+        assert.isUndefined(recovered?.goalWaitForPullRequest);
+      }
       const endedWait = { ...wait, resumeOnUpdate: false };
       yield* store.apply({
         id: EventId.make("event:goal-pr-wait:unwatch"),
@@ -7194,7 +7220,7 @@ it.effect.each([
         goalWaitChange: { wait: null, expected: wait },
       });
       assert.deepEqual(
-        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWait,
         endedWait,
       );
       yield* store.apply({
@@ -7203,18 +7229,16 @@ it.effect.each([
         threadId,
         occurredAt: now,
         goalWaitChange: { wait: null },
-        payload: { ...providerThread, goalWaitForPullRequest: null },
+        payload: { ...providerThread, goalWait: null },
       });
       yield* store.apply({
         id: EventId.make("event:goal-pr-wait:late-usage"),
         type: "provider-thread.updated",
         threadId,
         occurredAt: now,
-        payload: { ...providerThread, goalWaitForPullRequest: wait },
+        payload: { ...providerThread, goalWait: wait },
       });
-      assert.isNull(
-        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
-      );
+      assert.isNull((yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWait);
       const nextWait = { ...wait, startedAt: "2026-10-24T21:00:00.000Z" };
       yield* store.apply({
         id: EventId.make("event:goal-pr-wait:new-watch"),
@@ -7229,12 +7253,27 @@ it.effect.each([
         type: "provider-thread.updated",
         threadId,
         occurredAt: now,
-        payload: { ...providerThread, goalWaitForPullRequest: null },
+        payload: { ...providerThread, goalWait: null },
         goalWaitChange: { wait: null, expected: wait },
       });
       assert.deepEqual(
-        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWait,
         nextWait,
       );
+      const taskWait = {
+        kind: "tasks",
+        generation: CommandId.make("wait-recovery"),
+        taskIds: [NodeId.make("wait-recovery-task")],
+        startedAt: wait.startedAt,
+      } satisfies NonNullable<OrchestrationV2ProviderThread["goalWait"]>;
+      yield* store.apply({
+        id: EventId.make("event:goal-task-wait:recovery"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThread,
+        goalWaitChange: { wait: taskWait },
+      });
+      assert.include(yield* store.getRecoveryThreadIds("delegated-completions"), threadId);
     }).pipe(Effect.provide(layer)),
 );

@@ -365,7 +365,7 @@ it.effect.each(["stop", "stalled"])(
         forkedFrom: null,
         createdAt: now,
         updatedAt: now,
-        goalWaitForPullRequest: wait,
+        goalWait: wait,
       } satisfies OrchestrationV2ProviderThread;
       let stopped = false;
       let pauses = 0;
@@ -387,7 +387,7 @@ it.effect.each(["stop", "stalled"])(
           lastError: null,
         },
         events: Stream.empty,
-        waitForPullRequest: () =>
+        waitForGoal: () =>
           Effect.gen(function* () {
             pauses += 1;
             yield* Deferred.succeed(entered, undefined);
@@ -407,7 +407,7 @@ it.effect.each(["stop", "stalled"])(
         Layer.mock(ProjectionStore.ProjectionStoreV2)({
           getProviderControlContext: () =>
             Effect.sync(() => ({
-              providerThread: { ...providerThread, goalWaitForPullRequest: stopped ? null : wait },
+              providerThread: { ...providerThread, goalWait: stopped ? null : wait },
               providerTurn: undefined,
               attempt: undefined,
               message: undefined,
@@ -424,7 +424,7 @@ it.effect.each(["stop", "stalled"])(
       );
       yield* Effect.gen(function* () {
         const service = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
-        const pause = service.waitForPullRequest({
+        const pause = service.waitForGoal({
           threadId,
           providerSessionId,
           providerThreadId,

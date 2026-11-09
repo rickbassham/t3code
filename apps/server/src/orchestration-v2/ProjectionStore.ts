@@ -1,4 +1,9 @@
-import { presentProviderThreadGoal } from "@t3tools/shared/providerGoal";
+import {
+  presentProviderThreadGoal,
+  providerGoalWait,
+  normalizeProviderGoalWait,
+  goalWaitEqual,
+} from "@t3tools/shared/providerGoal";
 import { applyThreadPullRequestLinkUpdate } from "@t3tools/shared/threadPullRequests";
 import { projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
@@ -27,7 +32,7 @@ import type {
   OrchestrationV2DomainEvent,
   OrchestrationV2ProjectedTurnItem,
   OrchestrationV2ProviderThread,
-  OrchestrationV2PullRequestGoalWaitChange,
+  OrchestrationV2GoalWaitChange,
   OrchestrationV2ProviderTurn,
   OrchestrationV2Run,
   OrchestrationV2Subagent,
@@ -612,7 +617,12 @@ function needsRecovery(
         )
       );
     case "delegated-completions":
-      return projection.runs.some((run) => run.delegatedCompletion?.delivery != null);
+      return (
+        projection.runs.some((run) => run.delegatedCompletion?.delivery != null) ||
+        projection.providerThreads.some(
+          (thread) => thread.goalWait?.kind === "tasks" && thread.goalWait.resumeOnUpdate !== false,
+        )
+      );
     case "subagent-results": {
       const parentThreadId = projection.thread.lineage.parentThreadId;
       return (
@@ -754,24 +764,18 @@ export function emptyProjection(
 function withGoalWaitChange(
   incoming: OrchestrationV2ProviderThread,
   previous: OrchestrationV2ProviderThread | undefined,
-  change: OrchestrationV2PullRequestGoalWaitChange | undefined,
+  change: OrchestrationV2GoalWaitChange | undefined,
 ) {
-  let wait = previous?.goalWaitForPullRequest;
+  let wait = providerGoalWait(previous);
   const expected = change?.expected;
   if (
     change !== undefined &&
-    (expected === undefined ||
-      (wait != null &&
-        wait.host === expected.host &&
-        wait.repository === expected.repository &&
-        wait.number === expected.number &&
-        wait.startedAt === expected.startedAt &&
-        wait.resumeOnUpdate === expected.resumeOnUpdate))
+    (expected === undefined || (wait != null && goalWaitEqual(wait, expected)))
   ) {
     wait = change.wait;
   }
-  const { goalWaitForPullRequest: _incomingWait, ...thread } = incoming;
-  return wait === undefined ? thread : { ...thread, goalWaitForPullRequest: wait };
+  const { goalWait: _incomingWait, goalWaitForPullRequest: _legacyWait, ...thread } = incoming;
+  return wait === undefined ? thread : { ...thread, goalWait: wait };
 }
 
 function isQueuedProviderThreadPlaceholder(providerThread: OrchestrationV2ProviderThread): boolean {
@@ -1222,9 +1226,11 @@ const decodeSubagentPayload = Schema.decodeUnknownEffect(
 const decodeProviderSessionPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderSessionJsonSchema),
 );
-const decodeProviderThreadPayload = Schema.decodeUnknownEffect(
+const decodeStoredProviderThreadPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJsonSchema),
 );
+const decodeProviderThreadPayload = (payload: unknown) =>
+  decodeStoredProviderThreadPayload(payload).pipe(Effect.map(normalizeProviderGoalWait));
 const decodeProviderTurnPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderTurnJsonSchema),
 );
@@ -2376,9 +2382,13 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 updated_at = excluded.updated_at,
                 payload_json = CASE
                   WHEN ${event.goalWaitChange === undefined ? 0 : 1} = 1 THEN excluded.payload_json
-                  WHEN json_type(excluded.payload_json, '$.goalWaitForPullRequest') IS NULL
+                  WHEN json_type(excluded.payload_json, '$.goalWait') IS NULL
+                    AND json_type(orchestration_v2_projection_provider_threads.payload_json, '$.goalWait') IS NOT NULL
+                  THEN json_set(excluded.payload_json, '$.goalWait',
+                    json_extract(orchestration_v2_projection_provider_threads.payload_json, '$.goalWait'))
+                  WHEN json_type(excluded.payload_json, '$.goalWait') IS NULL
                     AND json_type(orchestration_v2_projection_provider_threads.payload_json, '$.goalWaitForPullRequest') IS NOT NULL
-                  THEN json_set(excluded.payload_json, '$.goalWaitForPullRequest',
+                  THEN json_set(excluded.payload_json, '$.goalWait',
                     json_extract(orchestration_v2_projection_provider_threads.payload_json, '$.goalWaitForPullRequest'))
                   ELSE excluded.payload_json
                 END
@@ -3945,6 +3955,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 SELECT thread_id FROM orchestration_v2_projection_runs
                 WHERE CASE WHEN json_valid(payload_json)
                   THEN json_type(payload_json, '$.delegatedCompletion.delivery') = 'object'
+                  ELSE 0 END
+                UNION
+                SELECT thread_id FROM orchestration_v2_projection_provider_threads
+                WHERE CASE WHEN json_valid(payload_json)
+                  THEN json_extract(payload_json, '$.goalWait.kind') = 'tasks'
+                    AND json_extract(payload_json, '$.goalWait.resumeOnUpdate') IS NOT 0
                   ELSE 0 END
               `;
             case "subagent-results":

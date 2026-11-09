@@ -1,3 +1,4 @@
+import * as DelegatedTaskReadiness from "../DelegatedTaskReadiness.ts";
 import * as OtelEnvironment from "@t3tools/shared/otelEnvironment";
 import { DEFAULT_SIGNAL_EXPORT } from "@t3tools/shared/observability";
 import * as NodeServices from "@effect/platform-node/NodeServices";
@@ -390,6 +391,7 @@ export function layerWithRegistry<Error>(
     ),
   );
   const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+    Layer.provide(DelegatedTaskReadiness.layer.pipe(Layer.provide(layerStores))),
     Layer.provide(
       Layer.mergeAll(
         layerContextHandoffServiceProvided,
@@ -448,6 +450,7 @@ export function layerWithRegistry<Error>(
     }),
   );
   const layerOrchestratorProvided = Orchestrator.layer.pipe(
+    Layer.provide(DelegatedTaskReadiness.layer.pipe(Layer.provide(layerStores))),
     Layer.provide(
       Layer.mergeAll(
         layerCheckpointServiceProvided,

@@ -720,13 +720,16 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
 
 export function buildCodexGoalContext(goal: OrchestrationV2ProviderGoal | null) {
   const waiting = goal?.waitingForPullRequest;
+  const tasks = goal?.waitingForTasks;
   return {
     t3_code_goal: {
       kind: "application",
       value:
-        waiting === undefined
-          ? "No automatic PR wait is active. Follow the latest native goal state and owner instructions. This context does not request a pause or resume."
-          : `The goal is active and automatically waiting for PR #${waiting.number} (${waiting.host}/${waiting.repository}). The native Codex goal is paused only to suppress automatic continuation while waiting; this is not an owner pause. Process this message or notification and act on relevant findings within the existing authorization. Preserve the PR watch; do not unwatch or mark the goal paused or blocked merely because the native goal reports paused. After handling the notification, end this turn and return to silent waiting. Do not poll or repeatedly register the same watch. T3 resumes the goal on a matching PR update. Explicit owner pause, stop, and unwatch instructions still take precedence.`,
+        tasks !== undefined
+          ? `The goal is active and automatically waiting for delegated tasks: ${tasks.length} selected tasks. The native goal is paused only to suppress automatic continuation; this is not an owner pause. Process this message or notification and act on relevant findings within the existing authorization. After handling it, end this turn and return to silent waiting while selected tasks remain pending. Do not poll task_status or build logs merely to wait. T3 resumes automatic goal continuation after all selected task results are ready. Explicit owner pause, stop, and resume instructions take precedence.`
+          : waiting === undefined
+            ? "No automatic goal wait is active. Follow the latest native goal state and owner instructions. This context does not request a pause or resume."
+            : `The goal is active and automatically waiting for PR #${waiting.number} (${waiting.host}/${waiting.repository}). The native Codex goal is paused only to suppress automatic continuation while waiting; this is not an owner pause. Process this message or notification and act on relevant findings within the existing authorization. Preserve the PR watch; do not unwatch or mark the goal paused or blocked merely because the native goal reports paused. After handling the notification, end this turn and return to silent waiting. Do not poll or repeatedly register the same watch. T3 resumes the goal on a matching PR update. Explicit owner pause, stop, and unwatch instructions still take precedence.`,
     },
   } satisfies Record<string, CodexSchema.V2TurnStartParams__AdditionalContextEntry>;
 }
@@ -1983,9 +1986,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const previous = rootProviderThreads.get(nativeThreadId);
           rootProviderThreads.set(nativeThreadId, {
             ...providerThread,
-            ...(providerThread.goalWaitForPullRequest === undefined &&
-              previous?.goalWaitForPullRequest !== undefined && {
-                goalWaitForPullRequest: previous.goalWaitForPullRequest,
+            ...(providerThread.goalWait === undefined &&
+              previous?.goalWait !== undefined && {
+                goalWait: previous.goalWait,
               }),
           });
           yield* emitGoalUpdate(nativeThreadId);
@@ -6280,7 +6283,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           if (goalThreadId == null) {
             return { turnInput, goalTurns: [] as ReadonlyArray<ActiveCodexTurnContext> };
           }
-          const providerThread = { ...turnInput.providerThread, goalWaitForPullRequest: null };
+          const providerThread = { ...turnInput.providerThread, goalWait: null };
           rootProviderThreads.set(goalThreadId, providerThread);
           yield* emitProviderEvent({
             type: "provider_thread.updated",
@@ -6462,12 +6465,9 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               );
             const current = yield* readGoal;
             goalsByNativeThread.set(threadId, current);
-            if (
-              command.type !== "show" &&
-              turnInput.providerThread.goalWaitForPullRequest != null
-            ) {
-              const wait = turnInput.providerThread.goalWaitForPullRequest;
-              const providerThread = { ...turnInput.providerThread, goalWaitForPullRequest: null };
+            if (command.type !== "show" && turnInput.providerThread.goalWait != null) {
+              const wait = turnInput.providerThread.goalWait;
+              const providerThread = { ...turnInput.providerThread, goalWait: null };
               turnInput = { ...turnInput, providerThread };
               rootProviderThreads.set(threadId, providerThread);
               yield* emitProviderEvent({
@@ -6711,7 +6711,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                     : { runtimePolicy: threadInput.runtimePolicy }),
                 }),
               });
-              if (threadInput.providerThread.goalWaitForPullRequest != null) {
+              if (threadInput.providerThread.goalWait != null) {
                 rootProviderThreads.set(nativeThreadId, threadInput.providerThread);
                 goalsByNativeThread.set(nativeThreadId, threadInput.providerThread.goal ?? null);
               }
@@ -6736,7 +6736,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
                 Effect.flatMap(decodeCodexResumeMetadata),
               );
-              if (threadInput.providerThread.goalWaitForPullRequest != null) {
+              if (threadInput.providerThread.goalWait != null) {
                 const { goal } = yield* client.request("thread/goal/get", {
                   threadId: nativeThreadId,
                 });
@@ -6779,21 +6779,17 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 ),
               ),
           ),
-          waitForPullRequest: Effect.fn("CodexAdapterV2.waitForPullRequest")(
+          waitForGoal: Effect.fn("CodexAdapterV2.waitForGoal")(
             function* ({ providerThread, providerTurnId }) {
               const threadId = yield* getNativeThreadId(providerThread);
-              if (providerThread.goalWaitForPullRequest == null) return;
+              const wait = providerThread.goalWait;
+              if (wait == null) return;
               const target = latestGoalTurnId(providerTurnId);
               const active = Array.from((yield* Ref.get(activeTurns)).values()).some(
                 (context) => context.providerTurnId === target,
               );
               const held = goalHolds.get(threadId)?.context.providerTurnId === target;
-              if (
-                (!active &&
-                  !held &&
-                  providerThread.goalWaitForPullRequest.resumeOnUpdate !== false) ||
-                goalStops.has(threadId)
-              )
+              if ((!active && !held && wait.resumeOnUpdate !== false) || goalStops.has(threadId))
                 return;
               const currentGoal = goalsByNativeThread.get(threadId) ?? providerThread.goal;
               if (currentGoal?.status !== "active" && currentGoal?.status !== "paused") return;
@@ -6810,7 +6806,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               (cause) =>
                 new ProviderAdapter.ProviderAdapterProtocolError({
                   driver: CODEX_PROVIDER,
-                  detail: "Failed to suspend a goal waiting for a pull request",
+                  detail: "Failed to change an automatically waiting goal",
                   cause,
                 }),
             ),
@@ -6883,25 +6879,26 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
                 : null;
             if (goalCommand !== null) return runGoalCommand(turnInput, goalCommand);
             return Effect.gen(function* () {
-              const wait = turnInput.providerThread.goalWaitForPullRequest;
+              const wait = turnInput.providerThread.goalWait;
               const source = turnInput.message.notification?.source;
               const wake = source?.kind === "monitor" ? source.pullRequest : undefined;
-              if (
-                wait != null &&
-                wait.resumeOnUpdate !== false &&
-                wake !== undefined &&
-                wait.host === wake.host &&
-                wait.repository === wake.repository &&
-                wait.number === wake.number &&
-                wait.startedAt === wake.startedAt
-              ) {
+              const matchingWake =
+                wait?.kind === "tasks"
+                  ? turnInput.goalWaitReady === true
+                  : wait != null &&
+                    wake !== undefined &&
+                    wait.host === wake.host &&
+                    wait.repository === wake.repository &&
+                    wait.number === wake.number &&
+                    wait.startedAt === wake.startedAt;
+              if (wait != null && wait.resumeOnUpdate !== false && matchingWake) {
                 const threadId = yield* getNativeThreadId(turnInput.providerThread);
                 const { goal } = yield* client.request("thread/goal/get", { threadId });
                 const current = goal == null ? null : providerGoalFromCodex(goal);
                 goalsByNativeThread.set(threadId, current);
                 const providerThread = {
                   ...turnInput.providerThread,
-                  goalWaitForPullRequest: null,
+                  goalWait: null,
                 };
                 turnInput = { ...turnInput, providerThread };
                 rootProviderThreads.set(threadId, providerThread);

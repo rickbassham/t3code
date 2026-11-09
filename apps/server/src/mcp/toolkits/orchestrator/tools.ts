@@ -18,6 +18,8 @@ import {
   OrchestratorMcpTaskCancelResult,
   OrchestratorMcpUpdateScheduledTaskInput,
   OrchestratorMcpTaskStatusInput,
+  OrchestratorMcpWaitForTasksInput,
+  OrchestratorMcpWaitForTasksResult,
   OrchestratorMcpThreadInterruptInput,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadListInput,
@@ -75,6 +77,18 @@ export const DelegateTaskTool = Tool.make("delegate_task", {
   .annotate(Tool.Title, "Delegate a child task")
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
+
+const WaitForTasksTool = Tool.make("wait_for_tasks", {
+  description:
+    "Wait quietly for named T3-owned delegated tasks of this thread. For an active Codex goal, suspends automatic continuation until all selected task results are ready, without stopping the tasks or pausing the logical goal. Use when no useful independent work remains; end your turn after waiting:true instead of polling task_status, processes, or logs. Partial results, task questions, and other notifications still reach you for bounded handling; return to waiting afterward. Already-finished tasks return immediately. Explicit owner pause/stop controls still win. Task IDs are the IDs returned by delegate_task, not child thread IDs. Unsupported for other providers.",
+  parameters: OrchestratorMcpWaitForTasksInput,
+  success: OrchestratorMcpWaitForTasksResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Waiting for delegated tasks")
+  .annotate(Tool.Readonly, false);
 
 const TaskStatusTool = Tool.make("task_status", {
   description:
@@ -275,6 +289,7 @@ export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,
+  WaitForTasksTool,
   TaskCancelTool,
   WorkflowStopTool,
   ScheduleTaskTool,
