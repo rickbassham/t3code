@@ -2541,7 +2541,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         runtimeMode: "full-access",
         interactionMode: "default",
         branch: null,
-        worktreePath: null,
+        worktreePath: "/tmp/t3-pr-watch-notification",
       });
       const key = { host: "github.com", repository: "pingdotgg/t3code", number: 7 };
       const url = "https://github.com/pingdotgg/t3code/pull/7";
@@ -2582,6 +2582,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         ...key,
         startedAt: started.startedAt,
         watch: recorded,
+        wake: {
+          messageId: MessageId.make("pr-watch-current-wake"),
+          text: "PR changed",
+          notification: { source: { kind: "monitor" }, outcome: "updated", summary: "#7" },
+        },
+      });
+      const dispatched = (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages;
+      assert.deepEqual(dispatched[0]?.notification?.source, {
+        kind: "monitor",
+        pullRequest: { ...key, startedAt: started.startedAt },
       });
       assert.deepEqual(yield* watchOf, recorded);
       assert.isTrue((yield* maintenance.rebuild).valid);
@@ -2612,7 +2622,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
       assert.equal(late._tag, "OrchestratorDispatchError");
       assert.isUndefined(yield* watchOf);
       const { messages } = yield* orchestrator.getThreadRecords(threadId, ["messages"]);
-      assert.deepEqual(messages, []);
+      assert.deepEqual(
+        messages.map((message) => message.id),
+        [MessageId.make("pr-watch-current-wake")],
+      );
     }),
   );
 

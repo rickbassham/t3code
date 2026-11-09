@@ -68,6 +68,7 @@ export class ProviderTurnStartError extends Schema.TaggedError<ProviderTurnStart
 ) {}
 
 const isProviderTurnStartError = Schema.is(ProviderTurnStartError);
+const isProviderAdapterTurnStartError = Schema.is(ProviderAdapter.ProviderAdapterTurnStartError);
 
 /**
  * Claude refuses these before it reads the prompt: replacing a process running background work,
@@ -206,6 +207,7 @@ export const layer: Layer.Layer<
         return yield* session.startTurn(input);
       }
       // A wake must read its wait and activate under the same lock as unwatch/Stop.
+      // Bound the native call so an unresponsive provider cannot block thread controls.
       return yield* threadDispatch
         .withLock(
           input.threadId,
@@ -225,18 +227,19 @@ export const layer: Layer.Layer<
                 cause: "Provider thread disappeared before its goal could resume.",
               });
             yield* session.startTurn({ ...input, providerThread });
-          }),
+          }).pipe(Effect.timeout("15 seconds")),
         )
         .pipe(
-          Effect.mapError(
-            (cause) =>
-              new ProviderAdapter.ProviderAdapterTurnStartError({
-                driver: session.driver,
-                threadId: input.threadId,
-                providerThreadId: input.providerThread.id,
-                runId: input.runId,
-                cause,
-              }),
+          Effect.mapError((cause) =>
+            isProviderAdapterTurnStartError(cause)
+              ? cause
+              : new ProviderAdapter.ProviderAdapterTurnStartError({
+                  driver: session.driver,
+                  threadId: input.threadId,
+                  providerThreadId: input.providerThread.id,
+                  runId: input.runId,
+                  cause,
+                }),
           ),
         );
     });

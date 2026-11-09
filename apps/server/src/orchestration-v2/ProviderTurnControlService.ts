@@ -227,8 +227,9 @@ export const layer: Layer.Layer<
           });
         },
         (effect, input) =>
+          // Bound the native pause without timing out time spent waiting for the lock.
           threadDispatch
-            .withLock(input.threadId, effect)
+            .withLock(input.threadId, effect.pipe(Effect.timeout("15 seconds")))
             .pipe(
               Effect.mapError(
                 (cause) => new ProviderTurnControlError({ ...input, operation: "wait", cause }),

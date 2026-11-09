@@ -9382,6 +9382,65 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       ),
     );
 
+    it.effect("replaces a cached cleared wait with the projection's new wait", () =>
+      Effect.gen(function* () {
+        const wait = {
+          host: "github.com",
+          repository: "owner/repo",
+          number: 414,
+          startedAt: "2026-10-23T21:00:00.000Z",
+        };
+        const prompt = "Continue with this PR wait";
+        const transcript = makeCodexReplayTranscript({
+          scenario: "goal-pr-new-wait-cache",
+          entries: [
+            ...sessionStart,
+            ...request(
+              3,
+              "thread/goal/get",
+              { threadId: nativeThreadId },
+              { goal: codexGoal("paused", 0) },
+            ),
+            ...withReplayRequestId(
+              codexReplayPreamble({ nativeThreadId, nativeTurnId: "new-wait-turn", prompt }).slice(
+                5,
+              ),
+              4,
+            ),
+            notification("new wait turn done", "turn/completed", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "new-wait-turn", status: "completed" }),
+            }),
+          ],
+        });
+        const updated = yield* Deferred.make<OrchestrationV2ProviderThread>();
+        let capture = false;
+        const harness = yield* makeCodexReplayHarness(transcript, (event) =>
+          capture && event.type === "provider_thread.updated"
+            ? Deferred.succeed(updated, event.providerThread)
+            : Effect.void,
+        );
+        const show = yield* goalTurnInput(harness, "/goal");
+        yield* harness.runtime.startTurn({
+          ...show,
+          providerThread: { ...show.providerThread, goalWaitForPullRequest: null },
+        });
+        yield* harness.firstTerminal;
+        capture = true;
+        const input = yield* goalTurnInput(harness, prompt);
+        yield* harness.runtime.startTurn({
+          ...input,
+          providerThread: { ...input.providerThread, goalWaitForPullRequest: wait },
+        });
+        assert.deepEqual((yield* Deferred.await(updated)).goalWaitForPullRequest, wait);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
     it.effect("resumes a persisted PR wait with the notification text", () =>
       Effect.gen(function* () {
         const wait = {

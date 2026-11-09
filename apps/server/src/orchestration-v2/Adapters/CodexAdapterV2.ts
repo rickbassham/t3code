@@ -1967,7 +1967,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           const previous = rootProviderThreads.get(nativeThreadId);
           rootProviderThreads.set(nativeThreadId, {
             ...providerThread,
-            ...(providerThread.goalWaitForPullRequest !== null &&
+            ...(providerThread.goalWaitForPullRequest === undefined &&
               previous?.goalWaitForPullRequest !== undefined && {
                 goalWaitForPullRequest: previous.goalWaitForPullRequest,
               }),
