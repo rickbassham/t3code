@@ -4918,13 +4918,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }) satisfies Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
 
   const hasPendingGoalWake = (
-    projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+    projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages" | "providerTurns">,
   ) =>
     projection.runs.some(
-      (run) =>
-        (run.status === "queued" && run.queueHeld !== true) ||
-        run.status === "preparing" ||
-        run.status === "starting",
+      (run) => run.status === "queued" || run.status === "preparing" || run.status === "starting",
     ) ||
     projection.runs.some((run) => {
       const cohort = run.delegatedCompletion;
@@ -4932,7 +4929,8 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cohort?.disposition === "open" &&
         cohort.delivery != null &&
         cohort.delivery.taskIds.length > 0 &&
-        !projection.messages.some((message) => message.id === cohort.delivery?.messageId)
+        (!projection.messages.some((message) => message.id === cohort.delivery?.messageId) ||
+          isUndeliveredMailboxSteer(projection, cohort.delivery.messageId))
       );
     });
 
@@ -12023,13 +12021,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       wait.resumeOnUpdate === false
     )
       return;
-    const work = yield* projectionStore.getThreadRecords(threadId, ["subagents", "runs"]);
+    const work = yield* projectionStore.getThreadRecords(threadId, [
+      "subagents",
+      "runs",
+      "providerTurns",
+    ]);
     if (
       work.runs.some(
-        (run) =>
-          (run.status === "queued" && run.queueHeld !== true) ||
-          run.status === "preparing" ||
-          run.status === "starting",
+        (run) => run.status === "queued" || run.status === "preparing" || run.status === "starting",
       )
     )
       return;
@@ -12049,7 +12048,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     });
     // Completion delivery is asynchronous; a reserved delivery is already a wake, even before its message exists.
     if (
-      !hasPendingGoalWake({ runs: work.runs, messages }) &&
+      !hasPendingGoalWake({ runs: work.runs, providerTurns: work.providerTurns, messages }) &&
       !messages.some((message) => message.id === ready.messageId)
     ) {
       yield* dispatchWithReceiptEffect(ready);

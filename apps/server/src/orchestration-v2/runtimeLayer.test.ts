@@ -18,6 +18,7 @@ import {
   TurnItemId,
   type ModelSelection,
   type OrchestrationV2Run,
+  type OrchestrationV2DomainEvent,
   ProjectId,
   type PullRequestDetail,
   type PullRequestComment,
@@ -2364,6 +2365,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     "recovery",
     "queued-wake",
     "delivery-in-flight",
+    "held-wake",
+    "consumed-steer",
   ])("task wait handles %s children without losing completion", (scenario) =>
     Effect.gen(function* () {
       const scoped = (id: string) => `${id}:${scenario}`;
@@ -2589,7 +2592,16 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         assert.instanceOf(stopped, Orchestrator.OrchestratorDispatchError);
         return;
       }
-      if (["acknowledged", "recovery", "queued-wake", "delivery-in-flight"].includes(scenario)) {
+      if (
+        [
+          "acknowledged",
+          "recovery",
+          "queued-wake",
+          "delivery-in-flight",
+          "held-wake",
+          "consumed-steer",
+        ].includes(scenario)
+      ) {
         yield* orchestrator.dispatch({
           type: "message.dispatch",
           commandId: CommandId.make(scoped("bounded-notification")),
@@ -2642,8 +2654,10 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           });
         }
         const readyMessageId = MessageId.make(`message:goal-tasks-ready:${wait.generation}`);
-        if (scenario === "queued-wake" || scenario === "delivery-in-flight") {
-          if (scenario === "queued-wake") {
+        if (
+          ["queued-wake", "delivery-in-flight", "held-wake", "consumed-steer"].includes(scenario)
+        ) {
+          if (scenario === "queued-wake" || scenario === "held-wake") {
             yield* orchestrator.dispatch({
               type: "message.dispatch",
               commandId: CommandId.make(scoped("existing-wake")),
@@ -2660,7 +2674,30 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                 summary: "Task results available",
               },
             });
+            if (scenario === "held-wake") {
+              const queued = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs.find(
+                (run) => run.status === "queued",
+              );
+              if (queued === undefined) return yield* Effect.die("Missing queued wake");
+              yield* sink.write({
+                commandId: CommandId.make(scoped("hold-wake")),
+                events: [
+                  {
+                    id: EventId.make(scoped("hold-wake")),
+                    type: "run.updated",
+                    threadId,
+                    runId: queued.id,
+                    occurredAt: now,
+                    payload: { ...queued, queueHeld: true },
+                  },
+                ],
+              });
+            }
           } else {
+            const boundedMessage = (yield* orchestrator.getThreadRecords(threadId, [
+              "messages",
+            ])).messages.find((message) => message.id === parentRun.userMessageId);
+            if (boundedMessage === undefined) return yield* Effect.die("Missing bounded message");
             yield* sink.write({
               commandId: CommandId.make(scoped("reserved-delivery")),
               events: [
@@ -2672,6 +2709,9 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                   occurredAt: now,
                   payload: {
                     ...boundedRun,
+                    ...(scenario === "consumed-steer"
+                      ? { status: "completed", completedAt: now }
+                      : {}),
                     delegatedCompletion: {
                       disposition: "open",
                       nextGeneration: 2,
@@ -2683,6 +2723,26 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
                     },
                   },
                 },
+                ...(scenario === "consumed-steer"
+                  ? [
+                      {
+                        id: EventId.make(scoped("consumed-steer-message")),
+                        type: "message.updated",
+                        threadId,
+                        occurredAt: now,
+                        payload: {
+                          ...boundedMessage,
+                          id: MessageId.make(scoped("reserved-wake")),
+                          runId: parentRun.id,
+                          delegatedCompletion: {
+                            parentRunId: parentRun.id,
+                            generation: 1,
+                            taskIds,
+                          },
+                        },
+                      } satisfies OrchestrationV2DomainEvent,
+                    ]
+                  : []),
               ],
             });
           }
