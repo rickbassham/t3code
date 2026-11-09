@@ -6,6 +6,11 @@ import {
 import { checkpointFileTotals } from "@t3tools/client-runtime/state/thread-checkpoints";
 import { COMPACT_COMMAND_PATTERN } from "@t3tools/client-runtime/state/context-window";
 import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
+import { presentProviderThreadGoal } from "@t3tools/shared/providerGoal";
+import {
+  threadPullRequestKeysEqual,
+  threadPullRequestsOf,
+} from "@t3tools/client-runtime/thread-pull-requests";
 import {
   latestUnheldRun,
   usageLimitRunPresentedAsLatest,
@@ -1440,10 +1445,13 @@ export function presentThreadShellFromProjection(
             .map((thread) => thread.providerInstanceId),
         ),
       ],
-      goal:
+      goal: presentProviderThreadGoal(
         projection.providerThreads.find(
           (thread) => thread.id === projection.thread.activeProviderThreadId,
-        )?.goal ?? null,
+        ),
+        projection.thread,
+        { threadPullRequestsOf, threadPullRequestKeysEqual },
+      ),
       itemCount: projection.turnItems.length,
       visibleItemCount: projection.visibleTurnItems.length,
       updatedAt,

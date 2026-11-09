@@ -14,6 +14,7 @@ import {
   OrchestrationV2ProviderFailure,
   OrchestrationV2ProviderRetry,
   OrchestrationV2ProviderThread,
+  OrchestrationV2GoalWaitChange,
   OrchestrationV2ProviderTurn,
   OrchestrationV2RuntimeRequest,
   OrchestrationV2Subagent,
@@ -61,6 +62,8 @@ export type ProviderAdapterV2RuntimePolicy = typeof ProviderAdapterV2RuntimePoli
 
 export const ProviderAdapterV2TurnMessage = Schema.Struct({
   messageId: MessageId,
+  notification: OrchestrationV2ConversationMessage.fields.notification,
+  delegatedCompletion: OrchestrationV2ConversationMessage.fields.delegatedCompletion,
   text: Schema.String,
   attachments: Schema.Array(ChatAttachment),
   createdBy: OrchestrationV2ConversationMessage.fields.createdBy,
@@ -94,6 +97,7 @@ export const ProviderAdapterV2Event = Schema.Union([
   }),
   Schema.Struct({
     type: Schema.Literal("provider_thread.updated"),
+    goalWaitChange: Schema.optional(OrchestrationV2GoalWaitChange),
     driver: ProviderDriverKind,
     providerThread: OrchestrationV2ProviderThread,
     /** Work remaining at this point in the event stream, including native continuations. */
@@ -493,6 +497,7 @@ export interface ProviderAdapterV2TurnInput {
   readonly nativeThreadHasTurns?: boolean;
   readonly providerTurnOrdinal: number;
   readonly restartContinuationOfRunId?: RunId;
+  readonly goalWaitReady?: boolean;
   readonly attemptId: RunAttemptId;
   readonly rootNodeId: NodeId;
   readonly providerThread: OrchestrationV2ProviderThread;
@@ -655,6 +660,10 @@ export interface ProviderAdapterV2SessionRuntime {
   readonly startTurn: (
     input: ProviderAdapterV2TurnInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;
+  readonly waitForGoal?: (input: {
+    readonly providerTurnId: ProviderTurnId;
+    readonly providerThread: OrchestrationV2ProviderThread;
+  }) => Effect.Effect<void, ProviderAdapterV2Error>;
   readonly compactThread?: (
     input: ProviderAdapterV2TurnInput,
   ) => Effect.Effect<void, ProviderAdapterV2Error>;

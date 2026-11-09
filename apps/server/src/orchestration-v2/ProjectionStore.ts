@@ -1,3 +1,9 @@
+import {
+  presentProviderThreadGoal,
+  providerGoalWait,
+  normalizeProviderGoalWait,
+  goalWaitEqual,
+} from "@t3tools/shared/providerGoal";
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
 import { pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
@@ -17,7 +23,10 @@ import {
   threadErrorSummary,
   usageLimitRunPresentedAsLatest,
 } from "@t3tools/shared/orchestrationV2ThreadError";
-import { threadPullRequestsOf } from "../sourceControl/threadPullRequests.ts";
+import {
+  threadPullRequestKeysEqual,
+  threadPullRequestsOf,
+} from "../sourceControl/threadPullRequests.ts";
 import type {
   OrchestrationV2AppThread,
   OrchestrationV2Checkpoint,
@@ -33,6 +42,7 @@ import type {
   OrchestrationV2OlderSettledCursor,
   OrchestrationV2ProjectedTurnItem,
   OrchestrationV2ProviderThread,
+  OrchestrationV2GoalWaitChange,
   OrchestrationV2ProviderTurn,
   OrchestrationV2Run,
   OrchestrationV2RuntimeRequest,
@@ -811,6 +821,24 @@ export function emptyProjection(
   };
 }
 
+// The app owns PR waits; native snapshots can carry an older copy after Stop.
+function withGoalWaitChange(
+  incoming: OrchestrationV2ProviderThread,
+  previous: OrchestrationV2ProviderThread | undefined,
+  change: OrchestrationV2GoalWaitChange | undefined,
+) {
+  let wait = providerGoalWait(previous);
+  const expected = change?.expected;
+  if (
+    change !== undefined &&
+    (expected === undefined || (wait != null && goalWaitEqual(wait, expected)))
+  ) {
+    wait = change.wait;
+  }
+  const { goalWait: _incomingWait, goalWaitForPullRequest: _legacyWait, ...thread } = incoming;
+  return wait === undefined ? thread : { ...thread, goalWait: wait };
+}
+
 function isQueuedProviderThreadPlaceholder(providerThread: OrchestrationV2ProviderThread): boolean {
   return (
     providerThread.status === "not_loaded" &&
@@ -946,7 +974,14 @@ export function applyToProjection(
                 activeProviderThreadId: event.payload.id,
               }
             : base.thread,
-        providerThreads: upsertById(base.providerThreads, event.payload),
+        providerThreads: upsertById(
+          base.providerThreads,
+          withGoalWaitChange(
+            event.payload,
+            base.providerThreads.find((thread) => thread.id === event.payload.id),
+            event.goalWaitChange,
+          ),
+        ),
       };
     case "provider-turn.updated":
       return {
@@ -1196,9 +1231,11 @@ const decodeSubagentPayload = Schema.decodeUnknownEffect(
 const decodeProviderSessionPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderSessionJsonSchema),
 );
-const decodeProviderThreadPayload = Schema.decodeUnknownEffect(
+const decodeStoredProviderThreadPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderThreadJsonSchema),
 );
+const decodeProviderThreadPayload = (payload: unknown) =>
+  decodeStoredProviderThreadPayload(payload).pipe(Effect.map(normalizeProviderGoalWait));
 const decodeProviderTurnPayload = Schema.decodeUnknownEffect(
   Schema.fromJsonString(OrchestrationV2ProviderTurnJsonSchema),
 );
@@ -1684,6 +1721,7 @@ export function threadShellFromProjection(
     goal: activeProviderGoalForShell(
       projection.providerThreads,
       projection.thread.activeProviderThreadId,
+      projection.thread,
     ),
     itemCount: activeLocalTurnItems(projection).length,
     visibleItemCount: projection.visibleTurnItems.length,
@@ -1732,8 +1770,13 @@ function providerInstanceHistoryForShell(input: {
 function activeProviderGoalForShell(
   providerThreads: ReadonlyArray<OrchestrationV2ThreadProjection["providerThreads"][number]>,
   activeProviderThreadId: OrchestrationV2ThreadProjection["thread"]["activeProviderThreadId"],
+  appThread: OrchestrationV2AppThread,
 ): OrchestrationV2ThreadShell["goal"] {
-  return providerThreads.find((thread) => thread.id === activeProviderThreadId)?.goal ?? null;
+  return presentProviderThreadGoal(
+    providerThreads.find((thread) => thread.id === activeProviderThreadId),
+    appThread,
+    { threadPullRequestsOf, threadPullRequestKeysEqual },
+  );
 }
 
 function isSilentRunForShell(
@@ -2379,7 +2422,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "provider-thread.updated": {
-              const payloadJson = yield* encodeProviderThreadPayload(event.payload);
+              const priorRows =
+                event.goalWaitChange === undefined
+                  ? []
+                  : yield* sql<{ readonly payload_json: string }>`
+                SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = ${event.payload.id}
+              `;
+              const prior =
+                priorRows[0] === undefined
+                  ? undefined
+                  : yield* decodeProviderThreadPayload(priorRows[0].payload_json);
+              const payloadJson = yield* encodeProviderThreadPayload(
+                withGoalWaitChange(event.payload, prior, event.goalWaitChange),
+              );
               const payload = parseEncodedPayload(payloadJson);
               yield* sql`
               INSERT INTO orchestration_v2_projection_provider_threads (
@@ -2422,7 +2477,18 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 first_run_ordinal = excluded.first_run_ordinal,
                 last_run_ordinal = excluded.last_run_ordinal,
                 updated_at = excluded.updated_at,
-                payload_json = excluded.payload_json
+                payload_json = CASE
+                  WHEN ${event.goalWaitChange === undefined ? 0 : 1} = 1 THEN excluded.payload_json
+                  WHEN json_type(excluded.payload_json, '$.goalWait') IS NULL
+                    AND json_type(orchestration_v2_projection_provider_threads.payload_json, '$.goalWait') IS NOT NULL
+                  THEN json_set(excluded.payload_json, '$.goalWait',
+                    json_extract(orchestration_v2_projection_provider_threads.payload_json, '$.goalWait'))
+                  WHEN json_type(excluded.payload_json, '$.goalWait') IS NULL
+                    AND json_type(orchestration_v2_projection_provider_threads.payload_json, '$.goalWaitForPullRequest') IS NOT NULL
+                  THEN json_set(excluded.payload_json, '$.goalWait',
+                    json_extract(orchestration_v2_projection_provider_threads.payload_json, '$.goalWaitForPullRequest'))
+                  ELSE excluded.payload_json
+                END
             `;
               if (
                 event.payload.appThreadId !== null &&
@@ -4163,6 +4229,12 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 SELECT thread_id FROM orchestration_v2_projection_runs
                 WHERE CASE WHEN json_valid(payload_json)
                   THEN json_type(payload_json, '$.delegatedCompletion.delivery') = 'object'
+                  ELSE 0 END
+                UNION
+                SELECT thread_id FROM orchestration_v2_projection_provider_threads
+                WHERE CASE WHEN json_valid(payload_json)
+                  THEN json_extract(payload_json, '$.goalWait.kind') = 'tasks'
+                    AND json_extract(payload_json, '$.goalWait.resumeOnUpdate') IS NOT 0
                   ELSE 0 END
               `;
             case "subagent-results":
@@ -6956,6 +7028,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
           goal: activeProviderGoalForShell(
             providerThreadsByThreadId.get(thread.id) ?? [],
             thread.activeProviderThreadId,
+            thread,
           ),
           itemCount: shellItemCountsByThreadId.get(thread.id)?.itemCount ?? 0,
           runlessItemCount: shellItemCountsByThreadId.get(thread.id)?.runlessItemCount ?? 0,

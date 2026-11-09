@@ -610,6 +610,46 @@ describe("isBackgroundWorkStopPending", () => {
 });
 
 describe("presentProviderGoal", () => {
+  it("distinguishes automatic PR waiting from a user pause", () => {
+    const goal = { objective: "Ship the feature", status: "paused" } satisfies Parameters<
+      typeof presentProviderGoal
+    >[0];
+    const waitingForPullRequest = { host: "github.com", repository: "owner/repo", number: 415 };
+    const waiting = presentProviderGoal({ ...goal, waitingForPullRequest }, false);
+    expect(waiting.title).toBe("Waiting for PR #415");
+    expect(
+      presentProviderGoal({ ...goal, status: "active", waitingForPullRequest }, false).title,
+    ).toBe(waiting.title);
+    expect(waiting.canResume).toBe(false);
+    expect(waiting.waitReason).toBe("Continues automatically when the PR changes.");
+    expect(presentProviderGoal(goal, false).canResume).toBe(true);
+    for (const status of ["complete", "blocked", "usage_limited", "budget_limited"] as const) {
+      expect(presentProviderGoal({ ...goal, status, waitingForPullRequest }, false).title).not.toBe(
+        waiting.title,
+      );
+    }
+  });
+
+  it("shows automatic task waits without offering manual resume", () => {
+    const goal = {
+      objective: "Deliver the issue",
+      status: "active",
+      waitingForTasks: [NodeId.make("task:a"), NodeId.make("task:b")],
+    } satisfies Parameters<typeof presentProviderGoal>[0];
+    expect(presentProviderGoal(goal, false)).toMatchObject({
+      title: "Waiting for 2 tasks",
+      canResume: false,
+    });
+    expect(presentProviderGoal({ ...goal, status: "paused" }, false).canResume).toBe(false);
+    expect(
+      presentProviderGoal({ ...goal, waitingForTasks: [NodeId.make("task:a")] }, false).title,
+    ).toBe("Waiting for 1 task");
+    expect(
+      presentProviderGoal({ objective: goal.objective, status: "paused" }, false).canResume,
+    ).toBe(true);
+    expect(presentProviderGoal({ ...goal, status: "blocked" }, false).canResume).toBe(true);
+  });
+
   it("rolls token counts that round to 1000k over to 1m", () => {
     const usage = (tokensUsed: number) =>
       presentProviderGoal(

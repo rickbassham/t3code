@@ -15,6 +15,8 @@ import {
   type OrchestrationV2TurnItem,
   OrchestratorMcpFailure,
   type OrchestratorMcpCapabilitiesInput,
+  type OrchestratorMcpWaitForTasksInput,
+  type OrchestratorMcpWaitForTasksResult,
   type OrchestratorMcpCapabilitiesResult,
   type OrchestratorMcpModelOption,
   type OrchestratorMcpCreateThreadsInput,
@@ -164,6 +166,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpDelegateTaskInput,
   ) => Effect.Effect<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure>;
+  readonly waitForTasks: (
+    scope: McpInvocationScope,
+    input: OrchestratorMcpWaitForTasksInput,
+  ) => Effect.Effect<OrchestratorMcpWaitForTasksResult, OrchestratorMcpFailure>;
   readonly taskStatus: (
     scope: McpInvocationScope,
     taskId: NodeId,
@@ -2618,6 +2624,27 @@ const make = Effect.gen(function* () {
           ),
         );
       return yield* readTask(scope, taskId, Option.isNone(waited), true);
+    }),
+    waitForTasks: Effect.fn("OrchestratorMcpService.waitForTasks")(function* (callerScope, input) {
+      const scope = yield* requireThreadScope(callerScope, "wait_for_tasks");
+      const key = yield* requestKey(input.clientRequestId);
+      yield* threadManagement
+        .dispatch({
+          type: "provider-goal.wait-for-tasks",
+          commandId: stableCommandId({ scope, requestKey: key, operation: "wait-for-tasks" }),
+          threadId: scope.thread.threadId,
+          providerInstanceId: scope.thread.providerInstanceId,
+          taskIds: input.taskIds,
+        })
+        .pipe(Effect.mapError((cause) => failure("orchestration_error", String(cause))));
+      const projection = yield* loadProjection(scope.thread.threadId);
+      const wait = projection.providerThreads.find(
+        (p) => p.id === projection.thread.activeProviderThreadId,
+      )?.goalWait;
+      return {
+        waiting: wait?.kind === "tasks" && wait.resumeOnUpdate !== false,
+        taskIds: wait?.kind === "tasks" ? wait.taskIds : [],
+      };
     }),
     taskStatus: Effect.fn("OrchestratorMcpService.taskStatus")(function* (callerScope, taskId) {
       const scope = yield* requireThreadScope(callerScope, "task_status");

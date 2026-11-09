@@ -1,3 +1,4 @@
+import * as DelegatedTaskReadiness from "./DelegatedTaskReadiness.ts";
 import * as WorktreeBranchSync from "./WorktreeBranchSync.ts";
 import * as GuestShareService from "../guest/GuestShareService.ts";
 import * as UsageLimitRecoveryWorker from "./UsageLimitRecoveryWorker.ts";
@@ -84,6 +85,8 @@ const layerStores = Layer.mergeAll(
   TurnItemPositionStore.layer,
 );
 
+const layerTaskReadiness = DelegatedTaskReadiness.layer.pipe(Layer.provide(layerStores));
+
 export const layerEventSink = EventSink.layerFromStores.pipe(Layer.provide(layerStores));
 const layerProjectionMaintenanceProvided = ProjectionMaintenance.layer.pipe(
   Layer.provide(layerStores),
@@ -163,6 +166,7 @@ const layerRunExecutionServiceProvided = RunExecutionService.layer.pipe(
 );
 
 const layerProviderTurnStartServiceProvided = ProviderTurnStartService.layer.pipe(
+  Layer.provide(layerTaskReadiness),
   Layer.provide(
     Layer.mergeAll(
       layerContextHandoffServiceProvided,
@@ -212,6 +216,7 @@ const layerRunFinalizationServiceProvided = RunFinalizationService.layer.pipe(
 );
 
 const layerOrchestratorProvided = Orchestrator.layer.pipe(
+  Layer.provide(layerTaskReadiness),
   Layer.provide(
     Layer.mergeAll(
       layerCheckpointServiceProvided,

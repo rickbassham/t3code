@@ -278,6 +278,19 @@ describe("pull request toolkit handlers", () => {
     }),
   );
 
+  it.effect("forwards an explicit PR wait without changing ordinary watch registration", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* harness.call("watch_pull_request", {
+        url: "https://github.com/t3tools/t3code/pull/9",
+        waitForUpdate: true,
+      });
+      expect(yield* Ref.get(harness.commands)).toMatchObject([
+        { type: "thread.pull-request.watch", number: 9, watching: true, waitForUpdate: true },
+      ]);
+    }),
+  );
+
   it.effect("watching an unlinked pull request links it first", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();

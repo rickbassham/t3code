@@ -24,6 +24,8 @@ import {
   OrchestratorMcpTaskCancelInput,
   OrchestratorMcpTaskCancelResult,
   OrchestratorMcpTaskStatusInput,
+  OrchestratorMcpWaitForTasksInput,
+  OrchestratorMcpWaitForTasksResult,
   OrchestratorMcpThreadInterruptInput,
   OrchestratorMcpThreadInterruptResult,
   OrchestratorMcpThreadListInput,
@@ -95,6 +97,18 @@ const DelegateTaskTool = Tool.make("delegate_task", {
   .annotate(Tool.Title, "Delegate a child task")
   .annotate(Tool.Destructive, true)
   .annotate(Tool.OpenWorld, true);
+
+const WaitForTasksTool = Tool.make("wait_for_tasks", {
+  description:
+    "Wait for delegated tasks this thread started, by the task IDs `delegate_task` returned, not child thread IDs. With an active Codex goal, the goal stops continuing until all their results are ready. The tasks keep running and the goal stays active. Call it when no other work is left, then end your turn if `waiting` is true. Do not poll `task_status`, processes, or logs. Partial results, task questions, and other notifications still reach you: handle them, then call this again. Finished tasks return at once. `/goal pause` and Stop still win. Codex only.",
+  parameters: OrchestratorMcpWaitForTasksInput,
+  success: OrchestratorMcpWaitForTasksResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies,
+})
+  .annotate(Tool.Title, "Waiting for delegated tasks")
+  .annotate(Tool.Readonly, false);
 
 const TaskStatusTool = Tool.make("task_status", {
   description:
@@ -353,6 +367,7 @@ export const OrchestratorToolkit = Toolkit.make(
   OrchestratorCapabilitiesTool,
   DelegateTaskTool,
   TaskStatusTool,
+  WaitForTasksTool,
   TaskCancelTool,
   WorkflowStopTool,
   BackgroundWaitTool,
