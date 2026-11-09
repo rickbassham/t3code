@@ -1,4 +1,5 @@
 import { SourceControlProviderKind } from "@t3tools/contracts";
+import * as Option from "effect/Option";
 import { describe, expect, it } from "vite-plus/test";
 import { EnvironmentId, ProjectId } from "@t3tools/contracts";
 
@@ -6,6 +7,7 @@ import {
   findExistingAddProject,
   getCloneDestinationPath,
   getCloneDirectoryLeafName,
+  getNewProjectPublishTargets,
   getCloneDirectoryName,
   getCloneDirectoryPath,
   getDefaultCloneUrl,
@@ -166,5 +168,35 @@ describe("add project shared logic", () => {
     expect(findExistingAddProject({ projects, environmentId: env, path: "/repo" })?.id).toBe(
       "project",
     );
+  });
+});
+
+describe("new project publish targets", () => {
+  it("keeps human owners and leaves App publishing to an explicit destination", () => {
+    const targets = (account: string, host = "github.com") =>
+      getNewProjectPublishTargets({
+        versionControlSystems: [],
+        sourceControlProviders: [
+          {
+            kind: SourceControlProviderKind.make("github"),
+            label: "GitHub",
+            status: "available",
+            installHint: "",
+            version: Option.none(),
+            detail: Option.none(),
+            auth: {
+              status: "authenticated",
+              account: Option.some(account),
+              host: Option.some(host),
+              detail: Option.none(),
+            },
+          },
+        ],
+      });
+    expect(targets("octocat").map(({ owner }) => owner)).toEqual(["octocat"]);
+    expect(targets("example[bot]")).toEqual([]);
+    expect(targets("enterprise-user", "enterprise.example").map(({ owner }) => owner)).toEqual([
+      "enterprise-user",
+    ]);
   });
 });
