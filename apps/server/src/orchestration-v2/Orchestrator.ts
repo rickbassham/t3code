@@ -4917,6 +4917,25 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       },
     }) satisfies Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>;
 
+  const hasPendingGoalWake = (
+    projection: Pick<OrchestrationV2ThreadProjection, "runs" | "messages">,
+  ) =>
+    projection.runs.some(
+      (run) =>
+        (run.status === "queued" && run.queueHeld !== true) ||
+        run.status === "preparing" ||
+        run.status === "starting",
+    ) ||
+    projection.runs.some((run) => {
+      const cohort = run.delegatedCompletion;
+      return (
+        cohort?.disposition === "open" &&
+        cohort.delivery != null &&
+        cohort.delivery.taskIds.length > 0 &&
+        !projection.messages.some((message) => message.id === cohort.delivery?.messageId)
+      );
+    });
+
   const dispatchMessage = Effect.fn("Orchestrator.dispatchMessage")(function* (
     command: Extract<OrchestrationV2Command, { readonly type: "message.dispatch" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -11543,7 +11562,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         if (pending.length === 0) {
           if (wait?.kind === "tasks") {
             const ready = taskWaitReadyCommand(command.threadId, wait);
-            if (!projection.messages.some((message) => message.id === ready.messageId)) {
+            if (
+              !hasPendingGoalWake(projection) &&
+              !projection.messages.some((message) => message.id === ready.messageId)
+            ) {
               yield* dispatchMessage(ready, events, effects);
             }
           }
@@ -11989,11 +12011,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   const offerTaskWaitReady = Effect.fn("Orchestrator.offerTaskWaitReady")(function* (
     threadId: ThreadId,
   ) {
-    const projection = yield* projectionStore.getThreadRecords(threadId, [
-      "providerThreads",
-      "subagents",
-      "messages",
-    ]);
+    const projection = yield* projectionStore.getThreadRecords(threadId, ["providerThreads"]);
     if (projection.thread.archivedAt !== null || projection.thread.deletedAt !== null) return;
     const providerThread = projection.providerThreads.find(
       (p) => p.id === projection.thread.activeProviderThreadId,
@@ -12005,8 +12023,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       wait.resumeOnUpdate === false
     )
       return;
+    const work = yield* projectionStore.getThreadRecords(threadId, ["subagents", "runs"]);
+    if (
+      work.runs.some(
+        (run) =>
+          (run.status === "queued" && run.queueHeld !== true) ||
+          run.status === "preparing" ||
+          run.status === "starting",
+      )
+    )
+      return;
     for (const taskId of wait.taskIds) {
-      const task = projection.subagents.find((t) => t.id === taskId && t.origin === "app_owned");
+      const task = work.subagents.find((t) => t.id === taskId && t.origin === "app_owned");
       if (
         task?.childThreadId == null ||
         (yield* delegatedTaskResultPending(task.childThreadId, taskId))
@@ -12016,7 +12044,14 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     // A completion can be steered or acknowledged during a bounded turn, leaving no queued wake.
     // The generation's command receipt makes this fallback idempotent across finalization and recovery.
     const ready = taskWaitReadyCommand(threadId, wait);
-    if (!projection.messages.some((message) => message.id === ready.messageId)) {
+    const { messages } = yield* projectionStore.getThreadRecords(threadId, ["messages"], {
+      messageRoles: ["user"],
+    });
+    // Completion delivery is asynchronous; a reserved delivery is already a wake, even before its message exists.
+    if (
+      !hasPendingGoalWake({ runs: work.runs, messages }) &&
+      !messages.some((message) => message.id === ready.messageId)
+    ) {
       yield* dispatchWithReceiptEffect(ready);
     }
   });

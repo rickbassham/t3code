@@ -2362,6 +2362,8 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     "acknowledged",
     "stopped",
     "recovery",
+    "queued-wake",
+    "delivery-in-flight",
   ])("task wait handles %s children without losing completion", (scenario) =>
     Effect.gen(function* () {
       const scoped = (id: string) => `${id}:${scenario}`;
@@ -2587,7 +2589,7 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         assert.instanceOf(stopped, Orchestrator.OrchestratorDispatchError);
         return;
       }
-      if (scenario === "acknowledged" || scenario === "recovery") {
+      if (["acknowledged", "recovery", "queued-wake", "delivery-in-flight"].includes(scenario)) {
         yield* orchestrator.dispatch({
           type: "message.dispatch",
           commandId: CommandId.make(scoped("bounded-notification")),
@@ -2606,6 +2608,24 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
         });
         const parentRun = (yield* orchestrator.getThreadRecords(threadId, ["runs"])).runs[0];
         if (parentRun === undefined) return yield* Effect.die("Missing bounded parent run");
+        const boundedRun = {
+          ...parentRun,
+          status: "running",
+          startedAt: now,
+        } satisfies OrchestrationV2Run;
+        yield* sink.write({
+          commandId: CommandId.make(scoped("bounded-running")),
+          events: [
+            {
+              id: EventId.make(scoped("bounded-running")),
+              type: "run.updated",
+              threadId,
+              runId: parentRun.id,
+              occurredAt: now,
+              payload: boundedRun,
+            },
+          ],
+        });
         for (const [index, child] of children.entries()) {
           yield* sink.write({
             commandId: CommandId.make(scoped(`ack-child-finish-${index}`)),
@@ -2622,6 +2642,59 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
           });
         }
         const readyMessageId = MessageId.make(`message:goal-tasks-ready:${wait.generation}`);
+        if (scenario === "queued-wake" || scenario === "delivery-in-flight") {
+          if (scenario === "queued-wake") {
+            yield* orchestrator.dispatch({
+              type: "message.dispatch",
+              commandId: CommandId.make(scoped("existing-wake")),
+              threadId,
+              messageId: MessageId.make(scoped("existing-wake")),
+              text: "Task results available",
+              attachments: [],
+              dispatchMode: { type: "queue_after_active" },
+              createdBy: "agent",
+              creationSource: "server",
+              notification: {
+                source: { kind: "delegated_task", taskIds },
+                outcome: "completed",
+                summary: "Task results available",
+              },
+            });
+          } else {
+            yield* sink.write({
+              commandId: CommandId.make(scoped("reserved-delivery")),
+              events: [
+                {
+                  id: EventId.make(scoped("reserved-delivery")),
+                  type: "run.updated",
+                  threadId,
+                  runId: parentRun.id,
+                  occurredAt: now,
+                  payload: {
+                    ...boundedRun,
+                    delegatedCompletion: {
+                      disposition: "open",
+                      nextGeneration: 2,
+                      delivery: {
+                        generation: 1,
+                        messageId: MessageId.make(scoped("reserved-wake")),
+                        taskIds,
+                      },
+                    },
+                  },
+                },
+              ],
+            });
+          }
+          yield* orchestrator.recoverDelegatedTasks;
+          yield* orchestrator.recoverDelegatedTasks;
+          const messages = (yield* orchestrator.getThreadRecords(threadId, ["messages"])).messages;
+          assert.isFalse(
+            messages.some((message) => message.id === readyMessageId),
+            "an existing wake makes the fallback unnecessary",
+          );
+          return;
+        }
         const afterSequence = yield* orchestrator.getThreadEventSequence(threadId);
         const ready = yield* Deferred.make<void>();
         yield* sink.stream({ threadId, afterSequence }).pipe(
