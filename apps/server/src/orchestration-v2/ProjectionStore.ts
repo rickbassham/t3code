@@ -26,6 +26,7 @@ import type {
   OrchestrationV2DomainEvent,
   OrchestrationV2ProjectedTurnItem,
   OrchestrationV2ProviderThread,
+  OrchestrationV2PullRequestGoalWaitChange,
   OrchestrationV2ProviderTurn,
   OrchestrationV2Run,
   OrchestrationV2Subagent,
@@ -748,6 +749,30 @@ export function emptyProjection(
   };
 }
 
+// The app owns PR waits; native snapshots can carry an older copy after Stop.
+function withGoalWaitChange(
+  incoming: OrchestrationV2ProviderThread,
+  previous: OrchestrationV2ProviderThread | undefined,
+  change: OrchestrationV2PullRequestGoalWaitChange | undefined,
+) {
+  let wait = previous?.goalWaitForPullRequest;
+  const expected = change?.expected;
+  if (
+    change !== undefined &&
+    (expected === undefined ||
+      (wait != null &&
+        wait.host === expected.host &&
+        wait.repository === expected.repository &&
+        wait.number === expected.number &&
+        wait.startedAt === expected.startedAt &&
+        wait.resumeOnUpdate === expected.resumeOnUpdate))
+  ) {
+    wait = change.wait;
+  }
+  const { goalWaitForPullRequest: _incomingWait, ...thread } = incoming;
+  return wait === undefined ? thread : { ...thread, goalWaitForPullRequest: wait };
+}
+
 function isQueuedProviderThreadPlaceholder(providerThread: OrchestrationV2ProviderThread): boolean {
   return (
     providerThread.status === "not_loaded" &&
@@ -881,7 +906,14 @@ export function applyToProjection(
                 activeProviderThreadId: event.payload.id,
               }
             : base.thread,
-        providerThreads: upsertById(base.providerThreads, event.payload),
+        providerThreads: upsertById(
+          base.providerThreads,
+          withGoalWaitChange(
+            event.payload,
+            base.providerThreads.find((thread) => thread.id === event.payload.id),
+            event.goalWaitChange,
+          ),
+        ),
       };
     case "provider-turn.updated":
       return {
@@ -2281,7 +2313,19 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "provider-thread.updated": {
-              const payloadJson = yield* encodeProviderThreadPayload(event.payload);
+              const priorRows =
+                event.goalWaitChange === undefined
+                  ? []
+                  : yield* sql<{ readonly payload_json: string }>`
+                SELECT payload_json FROM orchestration_v2_projection_provider_threads WHERE provider_thread_id = ${event.payload.id}
+              `;
+              const prior =
+                priorRows[0] === undefined
+                  ? undefined
+                  : yield* decodeProviderThreadPayload(priorRows[0].payload_json);
+              const payloadJson = yield* encodeProviderThreadPayload(
+                withGoalWaitChange(event.payload, prior, event.goalWaitChange),
+              );
               const payload = parseEncodedPayload(payloadJson);
               yield* sql`
               INSERT INTO orchestration_v2_projection_provider_threads (
@@ -2324,7 +2368,14 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 first_run_ordinal = excluded.first_run_ordinal,
                 last_run_ordinal = excluded.last_run_ordinal,
                 updated_at = excluded.updated_at,
-                payload_json = excluded.payload_json
+                payload_json = CASE
+                  WHEN ${event.goalWaitChange === undefined ? 0 : 1} = 1 THEN excluded.payload_json
+                  WHEN json_type(excluded.payload_json, '$.goalWaitForPullRequest') IS NULL
+                    AND json_type(orchestration_v2_projection_provider_threads.payload_json, '$.goalWaitForPullRequest') IS NOT NULL
+                  THEN json_set(excluded.payload_json, '$.goalWaitForPullRequest',
+                    json_extract(orchestration_v2_projection_provider_threads.payload_json, '$.goalWaitForPullRequest'))
+                  ELSE excluded.payload_json
+                END
             `;
               if (
                 event.payload.appThreadId !== null &&

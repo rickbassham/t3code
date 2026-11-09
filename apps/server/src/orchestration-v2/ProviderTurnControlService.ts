@@ -1,6 +1,7 @@
 import { projectComposerContextForProvider } from "@t3tools/shared/composerContextReferences";
 import {
   MessageId,
+  OrchestrationV2PullRequestGoalWait,
   type NodeId,
   ProviderSessionId,
   ProviderThreadId,
@@ -18,6 +19,7 @@ import * as Schema from "effect/Schema";
 
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import * as ProjectionStore from "./ProjectionStore.ts";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
 
 const yieldToRuntime = Effect.yieldNow.pipe(
@@ -35,7 +37,7 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
   "ProviderTurnControlError",
   {
     threadId: ThreadId,
-    operation: Schema.Literals(["interrupt", "restart", "steer"]),
+    operation: Schema.Literals(["interrupt", "restart", "steer", "wait"]),
     providerTurnId: ProviderTurnId,
     turnCompleted: Schema.optional(Schema.Boolean),
     cause: Schema.optional(Schema.Defect()),
@@ -43,8 +45,16 @@ export class ProviderTurnControlError extends Schema.TaggedError<ProviderTurnCon
 ) {}
 
 const isProviderTurnControlError = Schema.is(ProviderTurnControlError);
+const pullRequestGoalWaitEqual = Schema.toEquivalence(OrchestrationV2PullRequestGoalWait);
 
 export interface ProviderTurnControlServiceV2Shape {
+  readonly waitForPullRequest: (input: {
+    readonly wait: OrchestrationV2PullRequestGoalWait;
+    readonly threadId: ThreadId;
+    readonly providerSessionId: ProviderSessionId;
+    readonly providerThreadId: ProviderThreadId;
+    readonly providerTurnId: ProviderTurnId;
+  }) => Effect.Effect<void, ProviderTurnControlError>;
   readonly interrupt: (input: {
     readonly subagent?: {
       readonly id: NodeId;
@@ -90,6 +100,7 @@ export const layer: Layer.Layer<
   Effect.gen(function* () {
     const projections = yield* ProjectionStore.ProjectionStoreV2;
     const sessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
+    const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
 
     const load = Effect.fn("ProviderTurnControlService.load")(function* (input: {
       readonly threadId: ThreadId;
@@ -179,6 +190,51 @@ export const layer: Layer.Layer<
     });
 
     return ProviderTurnControlServiceV2.of({
+      waitForPullRequest: Effect.fn("ProviderTurnControlService.waitForPullRequest")(
+        function* (input) {
+          const context = yield* projections.getProviderControlContext(input.threadId, input);
+          const wait = context.providerThread?.goalWaitForPullRequest;
+          if (
+            wait == null ||
+            wait.startedAt !== input.wait.startedAt ||
+            wait.host !== input.wait.host ||
+            wait.repository !== input.wait.repository ||
+            wait.number !== input.wait.number ||
+            wait.resumeOnUpdate !== input.wait.resumeOnUpdate
+          )
+            return;
+          const session = yield* sessions.get(input.providerSessionId);
+          // A restarted session reconciles the durable wait before its next turn.
+          if (Option.isNone(session)) return;
+          if (session.value.waitForPullRequest === undefined) {
+            return yield* new ProviderTurnControlError({
+              ...input,
+              operation: "wait",
+              cause: "Provider does not support waiting on a goal.",
+            });
+          }
+          const current = yield* projections.getProviderControlContext(input.threadId, input);
+          const currentWait = current.providerThread?.goalWaitForPullRequest;
+          if (
+            currentWait == null ||
+            !pullRequestGoalWaitEqual(currentWait, input.wait) ||
+            current.providerThread === undefined
+          )
+            return;
+          yield* session.value.waitForPullRequest({
+            providerThread: current.providerThread,
+            providerTurnId: input.providerTurnId,
+          });
+        },
+        (effect, input) =>
+          threadDispatch
+            .withLock(input.threadId, effect)
+            .pipe(
+              Effect.mapError(
+                (cause) => new ProviderTurnControlError({ ...input, operation: "wait", cause }),
+              ),
+            ),
+      ),
       interrupt: Effect.fn("ProviderTurnControlService.interrupt")(
         function* (input) {
           const loaded = yield* load({ ...input, operation: "interrupt" });
@@ -410,4 +466,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));

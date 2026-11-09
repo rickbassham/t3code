@@ -1667,6 +1667,7 @@ function codexReplayPreamble(input: {
   readonly nativeTurnId: string;
   readonly prompt: string;
   readonly sentPrompt?: string;
+  readonly emptyInput?: true;
 }): Array<CodexReplay.CodexAppServerReplayEntry> {
   return [
     {
@@ -1757,7 +1758,7 @@ function codexReplayPreamble(input: {
         method: "turn/start",
         params: {
           threadId: input.nativeThreadId,
-          input: [{ type: "text", text: input.sentPrompt ?? input.prompt }],
+          input: input.emptyInput ? [] : [{ type: "text", text: input.sentPrompt ?? input.prompt }],
           cwd: "/workspace",
           model: "gpt-5.4",
           approvalPolicy: "never",
@@ -9301,6 +9302,288 @@ describe("CodexAdapterV2 post-settle continuation", () => {
       assert.isNull(CodexAdapterV2.parseCodexGoalCommand("set a /goal"));
     });
 
+    it.effect("releases a goal run when it explicitly waits for a pull request", () =>
+      Effect.gen(function* () {
+        const wait = {
+          host: "github.com",
+          repository: "owner/repo",
+          number: 414,
+          startedAt: "2026-10-23T21:00:00.000Z",
+        };
+        const transcript = makeCodexReplayTranscript({
+          scenario: "goal-pr-wait",
+          entries: [
+            ...sessionStart,
+            ...request(3, "thread/goal/get", { threadId: nativeThreadId }, { goal: null }),
+            ...request(
+              4,
+              "thread/goal/set",
+              {
+                threadId: nativeThreadId,
+                objective,
+                status: "paused",
+              },
+              { goal: codexGoal("paused", 0) },
+            ),
+            ...withReplayRequestId(
+              codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: "goal-wait-turn",
+                prompt: objective,
+              }).slice(5),
+              5,
+            ),
+            ...request(
+              6,
+              "thread/goal/set",
+              {
+                threadId: nativeThreadId,
+                status: "active",
+              },
+              { goal: codexGoal("active", 0) },
+            ),
+            ...request(
+              7,
+              "thread/goal/set",
+              {
+                threadId: nativeThreadId,
+                status: "paused",
+              },
+              { goal: codexGoal("paused", 1200) },
+            ),
+            notification("waiting turn done", "turn/completed", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "goal-wait-turn", status: "completed" }),
+            }),
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        yield* harness.runtime.startTurn(yield* goalTurnInput(harness, `/goal ${objective}`));
+        assert.isDefined(harness.runtime.waitForPullRequest);
+        const allocator = yield* IdAllocator.IdAllocatorV2;
+        yield* harness.runtime.waitForPullRequest!({
+          providerTurnId: allocator.derive.providerTurn({
+            driver: CodexAdapterV2.CODEX_DRIVER_KIND,
+            nativeTurnId: "goal-wait-turn",
+          }),
+          providerThread: { ...harness.providerThread, goalWaitForPullRequest: wait },
+        });
+        yield* harness.firstTerminal;
+        assert.deepEqual(
+          harness.terminalEvents().map((event) => event.status),
+          ["completed"],
+        );
+        assert.equal(providerGoals(harness.events).at(-1), "paused");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
+    it.effect("resumes a persisted PR wait with the notification text", () =>
+      Effect.gen(function* () {
+        const wait = {
+          host: "github.com",
+          repository: "owner/repo",
+          number: 414,
+          startedAt: "2026-10-23T21:00:00.000Z",
+        };
+        const prompt = "All required checks passed on PR 414.";
+        const transcript = makeCodexReplayTranscript({
+          scenario: "goal-pr-wake",
+          entries: [
+            ...sessionStart,
+            ...request(
+              3,
+              "thread/goal/get",
+              { threadId: nativeThreadId },
+              { goal: codexGoal("paused", 1200) },
+            ),
+            ...withReplayRequestId(
+              codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: "goal-wake-turn",
+                prompt,
+              }).slice(5),
+              4,
+            ),
+            ...request(
+              5,
+              "thread/goal/set",
+              { threadId: nativeThreadId, status: "active" },
+              { goal: codexGoal("active", 1200) },
+            ),
+            notification("goal done", "thread/goal/updated", {
+              threadId: nativeThreadId,
+              turnId: "goal-wake-turn",
+              goal: codexGoal("complete", 1500),
+            }),
+            notification("wake turn done", "turn/completed", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "goal-wake-turn", status: "completed" }),
+            }),
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const input = yield* goalTurnInput(harness, prompt);
+        yield* harness.runtime.startTurn({
+          ...input,
+          providerThread: {
+            ...input.providerThread,
+            goal: { objective, status: "paused" },
+            goalWaitForPullRequest: wait,
+          },
+          message: {
+            ...input.message,
+            notification: {
+              source: { kind: "monitor", pullRequest: wait },
+              outcome: "completed",
+              summary: "Checks passed",
+            },
+          },
+        });
+        yield* harness.firstTerminal;
+        assert.equal(providerGoals(harness.events).at(-1), "complete");
+        const updates = harness.events.filter((event) => event.type === "provider_thread.updated");
+        assert.isNull(updates.at(-1)?.providerThread.goalWaitForPullRequest);
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
+    it.effect.each(["active", "paused", "complete"] as const)(
+      "reconciles a persisted PR wait on resume without reviving a %s goal",
+      (status) =>
+        Effect.gen(function* () {
+          const wait = {
+            host: "github.com",
+            repository: "owner/repo",
+            number: 414,
+            startedAt: "2026-10-23T21:00:00.000Z",
+          };
+          const transcript = makeCodexReplayTranscript({
+            scenario: `goal-pr-resume-${status}`,
+            entries: [
+              ...sessionStart,
+              ...request(
+                3,
+                "thread/resume",
+                {
+                  threadId: nativeThreadId,
+                  excludeTurns: true,
+                  config: CodexAdapterV2.CODEX_THREAD_CONFIG,
+                },
+                { thread: { id: nativeThreadId, updatedAt: 1782622450 } },
+              ),
+              ...request(
+                4,
+                "thread/goal/get",
+                { threadId: nativeThreadId },
+                { goal: codexGoal(status, 1200) },
+              ),
+              ...(status === "active"
+                ? request(
+                    5,
+                    "thread/goal/set",
+                    { threadId: nativeThreadId, status: "paused" },
+                    { goal: codexGoal("paused", 1200) },
+                  )
+                : []),
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          const resumed = yield* harness.runtime.resumeThread({
+            providerThread: {
+              ...harness.providerThread,
+              goalWaitForPullRequest: wait,
+              goal: { objective, status: "paused" },
+            },
+            modelSelection: CODEX_TEST_MODEL_SELECTION,
+            runtimePolicy: CODEX_TEST_RUNTIME_POLICY,
+          });
+          assert.deepEqual(resumed.goalWaitForPullRequest, wait);
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+    );
+
+    it.effect.each(["other-pr", "old-watch", "manual-pause", "ended-watch"] as const)(
+      "does not resume a goal for %s",
+      (scenario) =>
+        Effect.gen(function* () {
+          const wait = {
+            host: "github.com",
+            repository: "owner/repo",
+            number: 414,
+            startedAt: "2026-10-23T21:00:00.000Z",
+          };
+          const prompt = "A pull request changed.";
+          const transcript = makeCodexReplayTranscript({
+            scenario: `goal-pr-unrelated-${scenario}`,
+            entries: [
+              ...codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: "unrelated-wake-turn",
+                prompt,
+              }),
+              notification("turn done", "turn/completed", {
+                threadId: nativeThreadId,
+                turn: makeCodexReplayTurn({ id: "unrelated-wake-turn", status: "completed" }),
+              }),
+            ],
+          });
+          const harness = yield* makeCodexReplayHarness(transcript);
+          const input = yield* goalTurnInput(harness, prompt);
+          yield* harness.runtime.startTurn({
+            ...input,
+            providerThread: {
+              ...input.providerThread,
+              goal: { objective, status: "paused" },
+              goalWaitForPullRequest:
+                scenario === "manual-pause"
+                  ? null
+                  : scenario === "ended-watch"
+                    ? { ...wait, resumeOnUpdate: false }
+                    : wait,
+            },
+            message: {
+              ...input.message,
+              notification: {
+                source: {
+                  kind: "monitor",
+                  pullRequest: {
+                    ...wait,
+                    number: scenario === "other-pr" ? 415 : wait.number,
+                    startedAt:
+                      scenario === "old-watch" ? "2026-10-22T21:00:00.000Z" : wait.startedAt,
+                  },
+                },
+                outcome: "updated",
+                summary: "PR changed",
+              },
+            },
+          });
+          yield* harness.firstTerminal;
+          assert.deepEqual(
+            harness.terminalEvents().map((event) => event.status),
+            ["completed"],
+          );
+        }).pipe(
+          Effect.scoped,
+          Effect.provide(
+            Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+          ),
+        ),
+    );
+
     it.effect("keeps a /goal run open across the turns Codex continues on its own", () =>
       Effect.gen(function* () {
         const transcript = makeCodexReplayTranscript({
@@ -9382,6 +9665,79 @@ describe("CodexAdapterV2 post-settle continuation", () => {
             [providerTurnId("goal-turn-1"), RunAttemptId.make("goal-attempt"), 1],
             [providerTurnId("goal-turn-2"), RunAttemptId.make("goal-attempt"), 2],
           ],
+        );
+        assert.equal(providerGoals(harness.events).at(-1), "complete");
+      }).pipe(
+        Effect.scoped,
+        Effect.provide(
+          Layer.mergeAll(IdAllocator.layer, McpProviderSessions.layer, NodeServices.layer),
+        ),
+      ),
+    );
+
+    it.effect("resumes an ended PR wait only through explicit /goal resume", () =>
+      Effect.gen(function* () {
+        const wait = {
+          host: "github.com",
+          repository: "owner/repo",
+          number: 414,
+          startedAt: "2026-10-23T21:00:00.000Z",
+          resumeOnUpdate: false,
+        };
+        const transcript = makeCodexReplayTranscript({
+          scenario: "goal-ended-wait-resume",
+          entries: [
+            ...sessionStart,
+            ...request(
+              3,
+              "thread/goal/get",
+              { threadId: nativeThreadId },
+              { goal: codexGoal("paused", 1200) },
+            ),
+            ...withReplayRequestId(
+              codexReplayPreamble({
+                nativeThreadId,
+                nativeTurnId: "explicit-resume-turn",
+                prompt: "unused",
+                emptyInput: true,
+              }).slice(5),
+              4,
+            ),
+            ...request(
+              5,
+              "thread/goal/set",
+              { threadId: nativeThreadId, status: "active" },
+              { goal: codexGoal("active", 1200) },
+            ),
+            notification("goal done", "thread/goal/updated", {
+              threadId: nativeThreadId,
+              turnId: "explicit-resume-turn",
+              goal: codexGoal("complete", 1500),
+            }),
+            notification("turn done", "turn/completed", {
+              threadId: nativeThreadId,
+              turn: makeCodexReplayTurn({ id: "explicit-resume-turn", status: "completed" }),
+            }),
+          ],
+        });
+        const harness = yield* makeCodexReplayHarness(transcript);
+        const input = yield* goalTurnInput(harness, "/goal resume");
+        yield* harness.runtime.startTurn({
+          ...input,
+          providerThread: {
+            ...input.providerThread,
+            goal: { objective, status: "paused" },
+            goalWaitForPullRequest: wait,
+          },
+        });
+        yield* harness.firstTerminal;
+        assert.isTrue(
+          harness.events.some(
+            (event) =>
+              event.type === "provider_thread.updated" &&
+              event.goalWaitChange?.wait === null &&
+              event.goalWaitChange.expected?.resumeOnUpdate === false,
+          ),
         );
         assert.equal(providerGoals(harness.events).at(-1), "complete");
       }).pipe(

@@ -43,6 +43,7 @@ import {
 } from "@t3tools/provider-core/server/handoffBudget";
 import { deliverContextHandoffs } from "./ContextHandoffDelivery.ts";
 import * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
+import * as ThreadCommandExecutor from "./ThreadCommandExecutor.ts";
 import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import * as ProjectionStore from "./ProjectionStore.ts";
 import * as ProviderSessionManager from "./ProviderSessionManager.ts";
@@ -125,6 +126,7 @@ export const layer: Layer.Layer<
     const projects = yield* ProjectService.ProjectService;
     const providerAuth = yield* ProviderAuthService.ProviderAuthService;
     const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+    const threadDispatch = yield* ThreadCommandExecutor.ThreadCommandExecutor;
     const providerSessions = yield* ProviderSessionManager.ProviderSessionManagerV2;
     const runExecution = yield* RunExecutionService.RunExecutionServiceV2;
     const runtimePolicy = yield* RuntimePolicy.RuntimePolicyV2;
@@ -193,6 +195,52 @@ export const layer: Layer.Layer<
       };
     };
 
+    const startProviderTurn = Effect.fn("ProviderTurnStartService.startProviderTurn")(function* (
+      session: ProviderAdapter.ProviderAdapterV2SessionRuntime,
+      input: ProviderAdapter.ProviderAdapterV2TurnInput,
+    ) {
+      if (
+        input.providerThread.driver !== "codex" ||
+        input.providerThread.goalWaitForPullRequest == null
+      ) {
+        return yield* session.startTurn(input);
+      }
+      // A wake must read its wait and activate under the same lock as unwatch/Stop.
+      return yield* threadDispatch
+        .withLock(
+          input.threadId,
+          Effect.gen(function* () {
+            const records = yield* projectionStore.getThreadRecords(input.threadId, [
+              "providerThreads",
+            ]);
+            const providerThread = records.providerThreads.find(
+              (thread) => thread.id === input.providerThread.id,
+            );
+            if (providerThread === undefined)
+              return yield* new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: input.threadId,
+                providerThreadId: input.providerThread.id,
+                runId: input.runId,
+                cause: "Provider thread disappeared before its goal could resume.",
+              });
+            yield* session.startTurn({ ...input, providerThread });
+          }),
+        )
+        .pipe(
+          Effect.mapError(
+            (cause) =>
+              new ProviderAdapter.ProviderAdapterTurnStartError({
+                driver: session.driver,
+                threadId: input.threadId,
+                providerThreadId: input.providerThread.id,
+                runId: input.runId,
+                cause,
+              }),
+          ),
+        );
+    });
+
     const makeDeliverySession = (
       session: ProviderAdapter.ProviderAdapterV2SessionRuntime,
       startWithHandoffs: (
@@ -209,7 +257,7 @@ export const layer: Layer.Layer<
           if (deliver !== undefined) return deliver(input, compact);
           return compact && session.compactThread !== undefined
             ? session.compactThread(input)
-            : session.startTurn(input);
+            : startProviderTurn(session, input);
         }).pipe(
           Effect.ensuring(
             Effect.sync(() => {
@@ -1171,7 +1219,10 @@ export const layer: Layer.Layer<
             }),
           });
           if (!(yield* isCurrentAttemptInStatus("running"))) return;
-          const start = compact ? session.compactThread! : session.startTurn;
+          const start = compact
+            ? session.compactThread!
+            : (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                startProviderTurn(session, input);
           const context = [delivery.context, restartNote]
             .filter((part) => part !== "")
             .join("\n\n");
@@ -1220,13 +1271,21 @@ export const layer: Layer.Layer<
               }),
         ),
       );
-      const deliverySession =
+      const baseDeliverySession =
         effectiveHandoffs.length === 0 &&
         missedItems.length === 0 &&
         restartNote === "" &&
         !noteContinuation
           ? session
           : makeDeliverySession(session, startWithHandoffs);
+      const deliverySession =
+        baseDeliverySession === session && runningProviderThread.goalWaitForPullRequest != null
+          ? {
+              ...session,
+              startTurn: (input: ProviderAdapter.ProviderAdapterV2TurnInput) =>
+                startProviderTurn(session, input),
+            }
+          : baseDeliverySession;
       return runExecution.startRootRun({
         commandId: CommandId.make(`command:effect:provider-turn.start:${run.id}`),
         appThread: projection.thread,
@@ -1262,6 +1321,7 @@ export const layer: Layer.Layer<
         hasUnpairedRunInterruptRequest: runControls.hasUnpairedRunInterruptRequest,
         message: {
           messageId: message.id,
+          ...(message.notification === undefined ? {} : { notification: message.notification }),
           text: userText,
           attachments: message.attachments,
           createdBy: message.createdBy,
@@ -1303,4 +1363,4 @@ export const layer: Layer.Layer<
       ),
     });
   }),
-);
+).pipe(Layer.provide(ThreadCommandExecutor.layer));

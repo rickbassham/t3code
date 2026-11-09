@@ -2355,6 +2355,175 @@ it.layer(layerTest)("OrchestrationV2LayerLive lifecycle", (it) => {
     }),
   );
 
+  it.effect("commits a Codex PR wait, preserves manual suspension, and honors goal controls", () =>
+    Effect.gen(function* () {
+      const orchestrator = yield* Orchestrator.OrchestratorV2;
+      const sink = yield* EventSink.EventSinkV2;
+      const outbox = yield* EffectOutbox.EffectOutboxV2;
+      const threadId = ThreadId.make("runtime-codex-pr-wait");
+      yield* orchestrator.dispatch({
+        type: "thread.create",
+        commandId: CommandId.make("goal-pr-create"),
+        threadId,
+        projectId: ProjectId.make("goal-pr-project"),
+        title: "Wait",
+        modelSelection,
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        branch: null,
+        worktreePath: "/tmp/t3-goal-pr-wait",
+        createdBy: "user",
+        creationSource: "web",
+      });
+      const now = yield* DateTime.now;
+      const providerThreadId = ProviderThreadId.make("provider-thread:goal-pr");
+      yield* sink.write({
+        commandId: CommandId.make("goal-pr-seed"),
+        events: [
+          {
+            id: EventId.make("goal-pr-provider"),
+            type: "provider-thread.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: providerThreadId,
+              driver: ProviderDriverKind.make("codex"),
+              providerInstanceId: modelSelection.instanceId,
+              providerSessionId: ProviderSessionId.make("goal-pr-session"),
+              appThreadId: threadId,
+              ownerNodeId: null,
+              nativeThreadRef: null,
+              nativeConversationHeadRef: null,
+              status: "active",
+              firstRunOrdinal: 1,
+              lastRunOrdinal: 1,
+              handoffIds: [],
+              forkedFrom: null,
+              goal: { objective: "Ship the feature", status: "active" },
+              createdAt: now,
+              updatedAt: now,
+            },
+          },
+          {
+            id: EventId.make("goal-pr-turn"),
+            type: "provider-turn.updated",
+            threadId,
+            occurredAt: now,
+            payload: {
+              id: ProviderTurnId.make("goal-pr-turn"),
+              providerThreadId,
+              nodeId: NodeId.make("goal-pr-node"),
+              runAttemptId: null,
+              nativeTurnRef: null,
+              ordinal: 1,
+              status: "running",
+              startedAt: now,
+              completedAt: null,
+            },
+          },
+        ],
+      });
+      const key = { host: "github.com", repository: "owner/repo", number: 414 };
+      const ordinary = CommandId.make("goal-pr-watch");
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: ordinary,
+        threadId,
+        ...key,
+        watching: true,
+        link: { url: "https://github.com/owner/repo/pull/414", source: "agent" },
+      });
+      assert.deepEqual(yield* outbox.listByCommandId(ordinary), []);
+      const commandId = CommandId.make("goal-pr-wait");
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId,
+        threadId,
+        ...key,
+        watching: true,
+        waitForUpdate: true,
+      });
+      const records = yield* orchestrator.getThreadRecords(threadId, ["providerThreads"]);
+      const wait = records.providerThreads[0]?.goalWaitForPullRequest;
+      assert.isDefined(wait);
+      if (wait == null) return yield* Effect.die("PR wait was not persisted");
+      assert.deepEqual(
+        (yield* outbox.listByCommandId(commandId)).map((entry) => entry.request),
+        [
+          {
+            type: "provider-goal.wait-for-pull-request",
+            providerSessionId: ProviderSessionId.make("goal-pr-session"),
+            providerThreadId,
+            providerTurnId: ProviderTurnId.make("goal-pr-turn"),
+            wait,
+          },
+        ],
+      );
+      const unwatchId = CommandId.make("goal-pr-unwatch");
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: unwatchId,
+        threadId,
+        ...key,
+        watching: false,
+      });
+      const endedWait = { ...wait, resumeOnUpdate: false };
+      assert.deepEqual(
+        (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
+          ?.goalWaitForPullRequest,
+        endedWait,
+      );
+      assert.deepEqual(
+        (yield* outbox.listByCommandId(unwatchId)).map((entry) => entry.request),
+        [
+          {
+            type: "provider-goal.wait-for-pull-request",
+            providerSessionId: ProviderSessionId.make("goal-pr-session"),
+            providerThreadId,
+            providerTurnId: ProviderTurnId.make("goal-pr-turn"),
+            wait: endedWait,
+          },
+        ],
+      );
+      for (const control of ["edit", "resume"]) {
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make(`goal-pr-${control}`),
+          threadId,
+          messageId: MessageId.make(`goal-pr-${control}`),
+          text: `/goal ${control}`,
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        assert.deepEqual(
+          (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
+            ?.goalWaitForPullRequest,
+          control === "edit" ? endedWait : null,
+        );
+      }
+      // Start another wait to independently check Stop's cancellation.
+      yield* orchestrator.dispatch({
+        type: "thread.pull-request.watch",
+        commandId: CommandId.make("goal-pr-wait-again"),
+        threadId,
+        ...key,
+        watching: true,
+        waitForUpdate: true,
+      });
+      yield* orchestrator.dispatch({
+        type: "thread.stop",
+        commandId: CommandId.make("goal-pr-stop"),
+        threadId,
+      });
+      assert.isNull(
+        (yield* orchestrator.getThreadRecords(threadId, ["providerThreads"])).providerThreads[0]
+          ?.goalWaitForPullRequest,
+      );
+    }),
+  );
+
   it.effect("starts, records, and stops a pull request watch", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;

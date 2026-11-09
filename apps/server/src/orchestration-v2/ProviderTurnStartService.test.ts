@@ -31,6 +31,7 @@ import * as Option from "effect/Option";
 import * as Path from "effect/Path";
 import * as PlatformError from "effect/PlatformError";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
@@ -526,7 +527,7 @@ function makeLocalCommandHarness(input: {
       ),
     ensureThread: () => Effect.succeed(providerThread),
   };
-  const open = vi.fn(() =>
+  const open = vi.fn<ProviderSessionManager.ProviderSessionManagerV2Shape["open"]>(() =>
     input.interruptOpen === true
       ? Effect.interrupt
       : "historyReadFailureAfterFallback" in input
@@ -736,12 +737,12 @@ effectIt.effect.each(["cleanup-first", "startup-first"])(
         fileSystem.makeDirectory(worktreePath).pipe(Effect.as({} as never), Effect.orDie),
       );
       const open = harness.open.getMockImplementation()!;
-      harness.open.mockImplementation(() =>
+      harness.open.mockImplementation((input) =>
         Effect.gen(function* () {
           expect(yield* fileSystem.exists(worktreePath).pipe(Effect.orDie)).toBe(true);
           yield* Deferred.succeed(openEntered, undefined);
           if (order === "startup-first") yield* Deferred.await(release);
-          return yield* open();
+          return yield* open(input);
         }),
       );
       let cleanupEntered = false;
@@ -1289,3 +1290,91 @@ for (const previousMessages of [[], ["/compact", " /COMPACT "]]) {
       }),
   );
 }
+
+effectIt.effect("re-reads the PR suspension immediately before starting a watcher wake", () =>
+  Effect.gen(function* () {
+    const harness = makeLocalCommandHarness({ text: "A pull request changed." });
+    const initial = harness.projection();
+    const originalThread = initial.providerThreads.find(
+      (thread) => thread.id === initial.thread.activeProviderThreadId,
+    );
+    if (originalThread === undefined || originalThread.providerSessionId === null)
+      return yield* Effect.die("Missing provider fixture");
+    const wait = {
+      host: "github.com",
+      repository: "owner/repo",
+      number: 414,
+      startedAt: "2026-10-23T21:00:00.000Z",
+    };
+    const providerThread = {
+      ...originalThread,
+      goal: { objective: "Ship the feature", status: "paused" },
+      goalWaitForPullRequest: wait,
+    } satisfies OrchestrationV2ThreadProjection["providerThreads"][number];
+    harness.setProjection({ ...initial, providerThreads: [providerThread] });
+    const startTurn = vi.fn<ProviderAdapter.ProviderAdapterV2SessionRuntime["startTurn"]>(
+      () => Effect.void,
+    );
+    const runtime = {
+      instanceId: providerThread.providerInstanceId,
+      driver: providerThread.driver,
+      providerSessionId: originalThread.providerSessionId,
+      providerSession: {
+        id: originalThread.providerSessionId,
+        driver: providerThread.driver,
+        providerInstanceId: providerThread.providerInstanceId,
+        status: "running",
+        cwd: "/tmp/native-account-command",
+        model: "gpt-5.4",
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: providerThread.createdAt,
+        updatedAt: providerThread.updatedAt,
+        lastError: null,
+      },
+      events: Stream.empty,
+      ensureThread: () => Effect.succeed(providerThread),
+      resumeThread: () => Effect.succeed(providerThread),
+      startTurn,
+      steerTurn: () => Effect.die("unused"),
+      interruptTurn: () => Effect.die("unused"),
+      respondToRuntimeRequest: () => Effect.die("unused"),
+      readThreadSnapshot: () => Effect.die("unused"),
+      rollbackThread: () => Effect.die("unused"),
+      forkThread: () => Effect.die("unused"),
+    } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    harness.open.mockImplementation(() => Effect.succeed(runtime));
+    harness.startRootRun.mockImplementation((input) =>
+      Effect.gen(function* () {
+        // Unwatch committed after the turn input was prepared, before native activation.
+        const current = harness.projection();
+        harness.setProjection({
+          ...current,
+          providerThreads: current.providerThreads.map((thread) => ({
+            ...thread,
+            goalWaitForPullRequest: { ...wait, resumeOnUpdate: false },
+          })),
+        });
+        yield* input.session
+          .startTurn({
+            appThread: input.appThread,
+            threadId: input.run.threadId,
+            runId: input.run.id,
+            runOrdinal: input.run.ordinal,
+            providerTurnOrdinal: input.providerTurnOrdinal,
+            attemptId: input.attemptId,
+            rootNodeId: input.rootNode.id,
+            providerThread: input.providerThread,
+            message: input.message,
+            modelSelection: input.modelSelection,
+            runtimePolicy: input.runtimePolicy,
+          })
+          .pipe(Effect.orDie);
+      }),
+    );
+    yield* harness.start;
+    expect(startTurn).toHaveBeenCalledOnce();
+    expect(startTurn.mock.calls[0]?.[0].providerThread.goalWaitForPullRequest?.resumeOnUpdate).toBe(
+      false,
+    );
+  }),
+);

@@ -7072,3 +7072,116 @@ it.layer(layerTest)("ProjectionStoreV2", (it) => {
     }),
   );
 });
+
+it.effect.each([
+  ["memory", ProjectionStore.layerMemory],
+  ["SQL", layerTest],
+] as const)(
+  "%s preserves a PR goal wait through native updates and clears it explicitly",
+  ([, layer]) =>
+    Effect.gen(function* () {
+      const store = yield* ProjectionStore.ProjectionStoreV2;
+      const threadId = yield* addRolledBackRecoveryCandidate("goal-pr-wait");
+      const now = yield* DateTime.now;
+      const providerThread = {
+        id: ProviderThreadId.make("provider-thread:goal-pr-wait"),
+        driver,
+        providerInstanceId,
+        providerSessionId: null,
+        appThreadId: threadId,
+        ownerNodeId: null,
+        nativeThreadRef: null,
+        nativeConversationHeadRef: null,
+        status: "idle",
+        firstRunOrdinal: 1,
+        lastRunOrdinal: 1,
+        handoffIds: [],
+        forkedFrom: null,
+        createdAt: now,
+        updatedAt: now,
+      } satisfies OrchestrationV2ProviderThread;
+      const wait = {
+        host: "github.com",
+        repository: "owner/repo",
+        number: 414,
+        startedAt: "2026-10-23T21:00:00.000Z",
+      };
+      for (const [name, payload] of [
+        ["wait", { ...providerThread, goalWaitForPullRequest: wait }],
+        ["usage", providerThread],
+      ] as const) {
+        yield* store.apply({
+          id: EventId.make(`event:goal-pr-wait:${name}`),
+          type: "provider-thread.updated",
+          threadId,
+          occurredAt: now,
+          ...(name === "wait" ? { goalWaitChange: { wait } } : {}),
+          payload,
+        });
+      }
+      assert.deepEqual(
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+        wait,
+      );
+      const endedWait = { ...wait, resumeOnUpdate: false };
+      yield* store.apply({
+        id: EventId.make("event:goal-pr-wait:unwatch"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThread,
+        goalWaitChange: { wait: endedWait, expected: wait },
+      });
+      yield* store.apply({
+        id: EventId.make("event:goal-pr-wait:late-auto-resume"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThread,
+        goalWaitChange: { wait: null, expected: wait },
+      });
+      assert.deepEqual(
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+        endedWait,
+      );
+      yield* store.apply({
+        id: EventId.make("event:goal-pr-wait:clear"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        goalWaitChange: { wait: null },
+        payload: { ...providerThread, goalWaitForPullRequest: null },
+      });
+      yield* store.apply({
+        id: EventId.make("event:goal-pr-wait:late-usage"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: { ...providerThread, goalWaitForPullRequest: wait },
+      });
+      assert.isNull(
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+      );
+      const nextWait = { ...wait, startedAt: "2026-10-24T21:00:00.000Z" };
+      yield* store.apply({
+        id: EventId.make("event:goal-pr-wait:new-watch"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: providerThread,
+        goalWaitChange: { wait: nextWait },
+      });
+      yield* store.apply({
+        id: EventId.make("event:goal-pr-wait:late-clear"),
+        type: "provider-thread.updated",
+        threadId,
+        occurredAt: now,
+        payload: { ...providerThread, goalWaitForPullRequest: null },
+        goalWaitChange: { wait: null, expected: wait },
+      });
+      assert.deepEqual(
+        (yield* store.getThreadProjection(threadId)).providerThreads[0]?.goalWaitForPullRequest,
+        nextWait,
+      );
+    }).pipe(Effect.provide(layer)),
+);

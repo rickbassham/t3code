@@ -540,6 +540,8 @@ function withoutPreparationResult(
   return rest;
 }
 
+const isOrchestratorProjectionError = Schema.is(OrchestratorProjectionError);
+
 function isBlockingRun(run: OrchestrationV2Run): boolean {
   return (
     run.status === "preparing" ||
@@ -2575,7 +2577,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           threadId: command.threadId,
           messageId: command.wake.messageId,
           text: command.wake.text,
-          notification: command.wake.notification,
+          notification: {
+            ...command.wake.notification,
+            source: { kind: "monitor", pullRequest: { ...key, startedAt: command.startedAt } },
+          },
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
           createdBy: "agent",
@@ -2586,6 +2591,121 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       );
     },
   );
+
+  const dispatchPullRequestWatch = Effect.fn("Orchestrator.dispatchPullRequestWatch")(function* (
+    command: Extract<OrchestrationV2Command, { readonly type: "thread.pull-request.watch" }>,
+    events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
+  ) {
+    yield* dispatchThreadMutation(command, events, effects);
+    if (command.watching && command.waitForUpdate !== true) return;
+    const projection = yield* loadProjectionForCommand(command, [
+      "providerThreads",
+      "providerTurns",
+    ]);
+    const providerThread = projection.providerThreads.find(
+      (candidate) => candidate.id === projection.thread.activeProviderThreadId,
+    );
+    if (!command.watching) {
+      const wait = providerThread?.goalWaitForPullRequest;
+      if (
+        providerThread === undefined ||
+        wait == null ||
+        !threadPullRequestKeysEqual(wait, command)
+      )
+        return;
+      const endedWait = { ...wait, resumeOnUpdate: false };
+      const now = yield* DateTime.now;
+      yield* emit(
+        events,
+        command,
+      )<Extract<OrchestrationV2DomainEvent, { readonly type: "provider-thread.updated" }>>({
+        type: "provider-thread.updated",
+        threadId: command.threadId,
+        driver: providerThread.driver,
+        providerInstanceId: providerThread.providerInstanceId,
+        occurredAt: now,
+        goalWaitChange: { wait: endedWait, expected: wait },
+        payload: { ...providerThread, goalWaitForPullRequest: endedWait, updatedAt: now },
+      });
+      const turn = projection.providerTurns
+        .filter((candidate) => candidate.providerThreadId === providerThread.id)
+        .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+      const providerSessionId = providerThread.providerSessionId;
+      if (turn !== undefined && providerSessionId !== null) {
+        yield* Ref.update(effects, (current) => [
+          ...current,
+          {
+            id: `effect:${command.commandId}:provider-goal.wait-for-pull-request`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-goal.wait-for-pull-request",
+              wait: endedWait,
+              providerSessionId,
+              providerThreadId: providerThread.id,
+              providerTurnId: turn.id,
+            },
+          } satisfies PendingOrchestrationEffectV2,
+        ]);
+      }
+      return;
+    }
+    if (
+      providerThread?.driver !== "codex" ||
+      providerThread.goal?.status !== "active" ||
+      providerThread.providerSessionId === null
+    )
+      return;
+    const providerSessionId = providerThread.providerSessionId;
+    const key = normalizeThreadPullRequestKey(command);
+    const changedThread = (yield* Ref.get(events)).findLast(
+      (event) => event.type === "thread.pull-request-synced",
+    );
+    const thread =
+      changedThread?.type === "thread.pull-request-synced"
+        ? changedThread.payload
+        : projection.thread;
+    const watch = threadPullRequestsOf(thread).find((candidate) =>
+      threadPullRequestKeysEqual(candidate, key),
+    )?.watch;
+    const turn = projection.providerTurns
+      .filter((candidate) => candidate.providerThreadId === providerThread.id)
+      .toSorted((a, b) => b.ordinal - a.ordinal)[0];
+    if (watch === undefined || turn === undefined) return;
+    const now = yield* DateTime.now;
+    yield* emit(
+      events,
+      command,
+    )<Extract<OrchestrationV2DomainEvent, { readonly type: "provider-thread.updated" }>>({
+      type: "provider-thread.updated",
+      threadId: command.threadId,
+      driver: providerThread.driver,
+      providerInstanceId: providerThread.providerInstanceId,
+      occurredAt: now,
+      goalWaitChange: { wait: { ...key, startedAt: watch.startedAt } },
+      payload: {
+        ...providerThread,
+        goalWaitForPullRequest: { ...key, startedAt: watch.startedAt },
+        updatedAt: now,
+      },
+    });
+    yield* Ref.update(effects, (current) => [
+      ...current,
+      {
+        id: `effect:${command.commandId}:provider-goal.wait-for-pull-request`,
+        commandId: command.commandId,
+        threadId: command.threadId,
+        request: {
+          type: "provider-goal.wait-for-pull-request",
+          wait: { ...key, startedAt: watch.startedAt },
+          providerSessionId,
+          providerThreadId: providerThread.id,
+          providerTurnId: turn.id,
+        },
+      } satisfies PendingOrchestrationEffectV2,
+    ]);
+  });
 
   const dispatchThreadMutation = Effect.fn("orchestrationV2.dispatch.threadMutation")(function* (
     command: Extract<
@@ -4777,6 +4897,33 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>,
   ) {
     let projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+    const goalArgument = /^\/goal(?:\s+([\s\S]*))?$/u.exec(command.text.trim())?.[1]?.trim();
+    if (
+      command.attachments.length === 0 &&
+      goalArgument !== undefined &&
+      goalArgument !== "" &&
+      goalArgument.toLowerCase() !== "edit"
+    ) {
+      const providerThread = projection.providerThreads.find(
+        (thread) => thread.id === projection.thread.activeProviderThreadId,
+      );
+      if (providerThread?.driver === "codex" && providerThread.goalWaitForPullRequest != null) {
+        const now = yield* DateTime.now;
+        yield* emit(
+          events,
+          command,
+        )<Extract<OrchestrationV2DomainEvent, { readonly type: "provider-thread.updated" }>>({
+          type: "provider-thread.updated",
+          threadId: command.threadId,
+          driver: providerThread.driver,
+          providerInstanceId: providerThread.providerInstanceId,
+          occurredAt: now,
+          goalWaitChange: { wait: null },
+          payload: { ...providerThread, goalWaitForPullRequest: null, updatedAt: now },
+        });
+        projection = yield* getProjectionWithPendingEvents(command.threadId, events);
+      }
+    }
     if (command.manualContinuationOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.manualContinuationOfRunId);
       const limited = latestRootProviderFailure(source ?? null, projection.turnItems);
@@ -9856,6 +10003,22 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         ),
       );
     if (projection.thread.deletedAt !== null) return undefined;
+    for (const providerThread of projection.providerThreads) {
+      if (providerThread.goalWaitForPullRequest == null) continue;
+      const now = yield* DateTime.now;
+      yield* emit(
+        events,
+        command,
+      )<Extract<OrchestrationV2DomainEvent, { readonly type: "provider-thread.updated" }>>({
+        type: "provider-thread.updated",
+        threadId: command.threadId,
+        driver: providerThread.driver,
+        providerInstanceId: providerThread.providerInstanceId,
+        occurredAt: now,
+        goalWaitChange: { wait: null },
+        payload: { ...providerThread, goalWaitForPullRequest: null, updatedAt: now },
+      });
+    }
     const cancelIdleOrphans = Effect.gen(function* () {
       const pending = yield* Ref.get(events);
       const children = new Map<
@@ -9956,7 +10119,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
     }).pipe(
       Effect.mapError((cause) =>
-        Schema.is(OrchestratorProjectionError)(cause)
+        isOrchestratorProjectionError(cause)
           ? cause
           : new OrchestratorProjectionError({ threadId: command.threadId, cause }),
       ),
@@ -11236,7 +11399,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.pull-request.link":
       case "thread.pull-request.unlink":
       case "thread.pull-request-link.sync":
-      case "thread.pull-request.watch":
       case "thread.pull-request.sync":
       case "thread.title.regeneration.complete":
       case "thread.runtime-mode.set":
@@ -11244,6 +11406,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "thread.model-selection.set":
       case "provider.switch":
         yield* dispatchThreadMutation(command, events, effects);
+        break;
+      case "thread.pull-request.watch":
+        yield* dispatchPullRequestWatch(command, events, effects);
         break;
       case "thread.pull-request-watch.sync":
         yield* dispatchPullRequestWatchSync(command, events, effects);
@@ -12033,7 +12198,7 @@ export const layer: Layer.Layer<
   Layer.provide(ThreadCommandExecutor.layer),
 );
 
-const layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
+const _layerUnavailable: Layer.Layer<OrchestratorV2> = Layer.succeed(
   OrchestratorV2,
   OrchestratorV2.of({
     resumeQueuedRuns: Effect.fail(

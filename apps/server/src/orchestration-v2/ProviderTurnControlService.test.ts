@@ -329,3 +329,100 @@ it.effect(
       assert.equal(interrupted?.nativeThreadRef?.nativeId, "native-thread:restart-session");
     }),
 );
+
+it.effect("does not pause a goal when Stop clears its wait during session lookup", () =>
+  Effect.gen(function* () {
+    const now = yield* DateTime.now;
+    const threadId = ThreadId.make("thread:stop-during-goal-wait");
+    const providerSessionId = ProviderSessionId.make("session:stop-during-goal-wait");
+    const providerThreadId = ProviderThreadId.make("provider-thread:stop-during-goal-wait");
+    const providerTurnId = ProviderTurnId.make("provider-turn:stop-during-goal-wait");
+    const wait = {
+      host: "github.com",
+      repository: "owner/repo",
+      number: 414,
+      startedAt: "2026-10-23T21:00:00.000Z",
+    };
+    const providerThread = {
+      id: providerThreadId,
+      driver,
+      providerInstanceId,
+      providerSessionId,
+      appThreadId: threadId,
+      ownerNodeId: null,
+      nativeThreadRef: null,
+      nativeConversationHeadRef: null,
+      status: "active",
+      firstRunOrdinal: 1,
+      lastRunOrdinal: 1,
+      handoffIds: [],
+      forkedFrom: null,
+      createdAt: now,
+      updatedAt: now,
+      goalWaitForPullRequest: wait,
+    } satisfies OrchestrationV2ProviderThread;
+    let stopped = false;
+    let pauses = 0;
+    const runtime = {
+      instanceId: providerInstanceId,
+      driver,
+      providerSessionId,
+      providerSession: {
+        id: providerSessionId,
+        driver,
+        providerInstanceId,
+        status: "running",
+        cwd: "/workspace",
+        model: modelSelection.model,
+        capabilities: CodexProviderCapabilitiesV2,
+        createdAt: now,
+        updatedAt: now,
+        lastError: null,
+      },
+      events: Stream.empty,
+      waitForPullRequest: () =>
+        Effect.sync(() => {
+          pauses += 1;
+        }),
+      ensureThread: () => Effect.die("unused"),
+      resumeThread: () => Effect.die("unused"),
+      startTurn: () => Effect.die("unused"),
+      steerTurn: () => Effect.die("unused"),
+      interruptTurn: () => Effect.die("unused"),
+      respondToRuntimeRequest: () => Effect.die("unused"),
+      readThreadSnapshot: () => Effect.die("unused"),
+      rollbackThread: () => Effect.die("unused"),
+      forkThread: () => Effect.die("unused"),
+    } satisfies ProviderAdapter.ProviderAdapterV2SessionRuntime;
+    const dependencies = Layer.mergeAll(
+      Layer.mock(ProjectionStore.ProjectionStoreV2)({
+        getProviderControlContext: () =>
+          Effect.sync(() => ({
+            providerThread: { ...providerThread, goalWaitForPullRequest: stopped ? null : wait },
+            providerTurn: undefined,
+            attempt: undefined,
+            message: undefined,
+            run: undefined,
+          })),
+      }),
+      Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({
+        get: () =>
+          Effect.sync(() => {
+            stopped = true;
+            return Option.some(runtime);
+          }),
+      }),
+    );
+    yield* Effect.gen(function* () {
+      const service = yield* ProviderTurnControlService.ProviderTurnControlServiceV2;
+      yield* service.waitForPullRequest({
+        threadId,
+        providerSessionId,
+        providerThreadId,
+        providerTurnId,
+        wait,
+      });
+    }).pipe(Effect.provide(ProviderTurnControlService.layer.pipe(Layer.provide(dependencies))));
+    assert.equal(pauses, 0);
+  }),
+);
