@@ -33,6 +33,7 @@ import {
   ProviderDriverKind,
   type ProviderSetupError,
 } from "@t3tools/contracts";
+import { presentProviderThreadGoal } from "@t3tools/shared/providerGoal";
 import { SKILL_MENTION_PATTERN } from "@t3tools/shared/composerInlineTokens";
 import { AgentScope } from "@t3tools/shared/AgentScope";
 import * as HostProcess from "@t3tools/shared/HostProcess";
@@ -717,6 +718,19 @@ function codexRuntimeModeTurnDefaults(runtimeMode: RuntimeMode): {
   }
 }
 
+export function buildCodexGoalContext(goal: OrchestrationV2ProviderGoal | null) {
+  const waiting = goal?.waitingForPullRequest;
+  return {
+    t3_code_goal: {
+      kind: "application",
+      value:
+        waiting === undefined
+          ? "No automatic PR wait is active. Follow the latest native goal state and owner instructions. This context does not request a pause or resume."
+          : `The goal is active and automatically waiting for PR #${waiting.number} (${waiting.host}/${waiting.repository}). The native Codex goal is paused only to suppress automatic continuation while waiting; this is not an owner pause. Process this message or notification and act on relevant findings within the existing authorization. Preserve the PR watch; do not unwatch or mark the goal paused or blocked merely because the native goal reports paused. After handling the notification, end this turn and return to silent waiting. Do not poll or repeatedly register the same watch. T3 resumes the goal on a matching PR update. Explicit owner pause, stop, and unwatch instructions still take precedence.`,
+    },
+  } satisfies Record<string, CodexSchema.V2TurnStartParams__AdditionalContextEntry>;
+}
+
 export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTurnStartParams")(
   function* (input: {
     readonly nativeThreadId: string;
@@ -729,6 +743,7 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
     /** ChatGPT token sharing does not accept service tiers. */
     readonly omitServiceTier?: boolean;
     readonly appContext?: ProviderAdapter.ProviderAdapterV2TurnInput["appContext"];
+    readonly goal?: OrchestrationV2ProviderGoal | null;
   }) {
     const runtimeModeDefaults = codexRuntimeModeTurnDefaults(input.runtimePolicy.runtimeMode);
     const approvalPolicy =
@@ -771,10 +786,11 @@ export const buildCodexTurnStartParams = Effect.fn("CodexAdapterV2.buildCodexTur
             },
           )
         : undefined;
+    const goalContext = input.goal === undefined ? undefined : buildCodexGoalContext(input.goal);
     const additionalContext =
-      t3Context === undefined && Object.keys(appContext).length === 0
+      t3Context === undefined && Object.keys(appContext).length === 0 && goalContext === undefined
         ? undefined
-        : { ...t3Context, ...appContext };
+        : { ...t3Context, ...appContext, ...goalContext };
     const collaborationMode: CodexSchema.ClientRequest__CollaborationMode | undefined =
       input.runtimePolicy.interactionMode !== "plan" && developerInstructions === undefined
         ? undefined
@@ -6338,6 +6354,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
           ) {
             const threadId = yield* getNativeThreadId(turnInput.providerThread);
             const mcpSession = yield* mcpSessions.read(turnInput.threadId);
+            const goal = presentProviderThreadGoal(turnInput.providerThread, turnInput.appThread);
             const turnStartParams = yield* buildCodexTurnStartParams({
               nativeThreadId: threadId,
               codexInput,
@@ -6347,6 +6364,7 @@ export const makeCodexAdapterV2 = Effect.fn("makeCodexAdapterV2")(function* (
               browserToolsAvailable: mcpSession?.browserToolsAvailable ?? true,
               deviceToolsAvailable: mcpSession?.capabilities?.has("device") ?? false,
               omitServiceTier: adapterOptions.resolveRuntime !== undefined,
+              goal,
               ...(turnInput.appContext === undefined ? {} : { appContext: turnInput.appContext }),
             });
             yield* Ref.update(pendingRootTurns, (current) => {
