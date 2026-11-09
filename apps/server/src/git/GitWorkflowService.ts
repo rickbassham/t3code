@@ -6,6 +6,7 @@ import * as FileSystem from "effect/FileSystem";
 import {
   GitManagerError,
   GitCommandError,
+  type ThreadId,
   type VcsSwitchRefInput,
   type VcsSwitchRefResult,
   type VcsCreateRefInput,
@@ -33,6 +34,7 @@ import * as GitManager from "./GitManager.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as VcsDriverRegistry from "../vcs/VcsDriverRegistry.ts";
 import { withWorkspaceLease } from "../workspace/workspaceLease.ts";
+import * as WorktreeProtection from "../workspace/WorktreeProtection.ts";
 
 export class GitWorkflowService extends Context.Service<
   GitWorkflowService,
@@ -110,8 +112,10 @@ export class GitWorkflowService extends Context.Service<
       { readonly commitSha: string; readonly remoteRefName: string } | null,
       GitCommandError
     >;
+    /** Fails when an unarchived thread other than `exceptThreadId` uses the worktree. */
     readonly removeWorktree: (
       input: VcsRemoveWorktreeInput,
+      options?: { readonly exceptThreadId?: ThreadId },
     ) => Effect.Effect<void, GitCommandError>;
     readonly pruneWorktrees: (input: {
       readonly cwd: string;
@@ -176,6 +180,7 @@ export const make = Effect.gen(function* () {
   const git = yield* GitVcsDriver.GitVcsDriver;
   const gitManager = yield* GitManager.GitManager;
   const fileSystem = yield* FileSystem.FileSystem;
+  const protection = yield* WorktreeProtection.WorktreeProtection;
 
   // Nested projects and path aliases must share the checkout's branch-mutation lease.
   const withCheckoutLease = <A, E, R>(rootPath: string, effect: Effect.Effect<A, E, R>) =>
@@ -201,6 +206,16 @@ export const make = Effect.gen(function* () {
     );
     return handle;
   });
+
+  // Lock upkeep must not fail the Git command it runs beside.
+  const reconcileLocks = (cwd: string) =>
+    protection
+      .reconcile(cwd)
+      .pipe(
+        Effect.catchCause((cause) =>
+          Effect.logWarning("Failed to reconcile worktree locks", { cwd, cause }),
+        ),
+      );
 
   const ensureGitCommand = Effect.fn("GitWorkflowService.ensureGitCommand")(function* (
     operation: string,
@@ -413,6 +428,8 @@ export const make = Effect.gen(function* () {
     createWorktree: Effect.fn("GitWorkflowService.createWorktree")(function (input, options) {
       return ensureGitCommand("GitWorkflowService.createWorktree", input.cwd).pipe(
         Effect.andThen(gitManager.createWorktree(input, options)),
+        // A recreated worktree is already in use by its thread, and no thread event follows.
+        Effect.tap(() => reconcileLocks(input.cwd)),
       );
     }),
     listLocalBranchNames: Effect.fn("GitWorkflowService.listLocalBranchNames")(function (cwd) {
@@ -456,13 +473,18 @@ export const make = Effect.gen(function* () {
         );
       },
     ),
-    removeWorktree: Effect.fn("GitWorkflowService.removeWorktree")(function (input) {
+    removeWorktree: Effect.fn("GitWorkflowService.removeWorktree")(function (input, options) {
       return ensureGitCommand("GitWorkflowService.removeWorktree", input.cwd).pipe(
-        Effect.andThen(git.removeWorktree(input)),
+        Effect.andThen(
+          protection.assertRemovable({ ...input, exceptThreadId: options?.exceptThreadId }),
+        ),
+        Effect.andThen(protection.withoutLock(input, git.removeWorktree(input))),
       );
     }),
     pruneWorktrees: Effect.fn("GitWorkflowService.pruneWorktrees")(function (input) {
       return ensureGitCommand("GitWorkflowService.pruneWorktrees", input.cwd).pipe(
+        // Git keeps a locked worktree whose folder is gone, so release T3's locks on those first.
+        Effect.andThen(reconcileLocks(input.cwd)),
         Effect.andThen(git.pruneWorktrees(input)),
       );
     }),

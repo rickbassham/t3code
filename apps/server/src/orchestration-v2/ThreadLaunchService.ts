@@ -696,7 +696,10 @@ const make = Effect.gen(function* () {
             const removedBranch = createdBranch;
             // Forget worktrees only after removal succeeds; failed removals must not reuse partially written checkouts.
             yield* git
-              .removeWorktree({ cwd: project.workspaceRoot, path: removedPath, force: true })
+              .removeWorktree(
+                { cwd: project.workspaceRoot, path: removedPath, force: true },
+                { exceptThreadId: threadId },
+              )
               .pipe(
                 Effect.andThen(
                   removedBranch === null
