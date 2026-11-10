@@ -102,7 +102,8 @@ function shell(overrides: Partial<OrchestrationV2ThreadShell> = {}): Orchestrati
     latestUserMessageAt: null,
     createdAt: at(-30 * DAY_MS),
     updatedAt: at(-10 * DAY_MS),
-    archivedAt: null,
+    // Cleanup keeps worktrees of unarchived threads, so fixtures are archived by default.
+    archivedAt: at(-DAY_MS),
     settledOverride: null,
     settledAt: null,
     snoozedUntil: null,
@@ -231,6 +232,7 @@ describe("V2 storage cleanup eligibility", () => {
         storageCleanupThreadIdle(
           {
             ...candidateWithStatus("failed"),
+            archivedAt: null,
             latestRunId: runId,
             lastErrorClass: "usage_limit",
             usageLimitResetAt: resetAt,
@@ -1213,6 +1215,29 @@ describe("deleted thread worktrees", () => {
         reason: "Inactive for 30 days",
       });
       expect(yield* fixture.fs.exists(fixture.worktree)).toBe(false);
+    }).pipe(Effect.provide(cleanupTestLayer), Effect.scoped),
+  );
+
+  it.effect("keeps an idle worktree while an unarchived thread still uses it", () =>
+    Effect.gen(function* () {
+      yield* TestClock.setTime(NOW_MS);
+      const fixture = yield* cleanupFixture({
+        ...DEFAULT_SERVER_SETTINGS.storageCleanup,
+        worktreeAfterDays: 4,
+      });
+      const thread = shell({
+        branch: "feature",
+        worktreePath: fixture.worktree,
+        archivedAt: null,
+      });
+      fixture.setThreads([thread]);
+      const report = yield* fixture.service.runNow;
+      expect(report.entries[0]).toMatchObject({
+        threadId: thread.id,
+        outcome: "kept",
+        reason: "Referenced by a resumable thread",
+      });
+      expect(yield* fixture.fs.exists(fixture.worktree)).toBe(true);
     }).pipe(Effect.provide(cleanupTestLayer), Effect.scoped),
   );
 

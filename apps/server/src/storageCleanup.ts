@@ -928,6 +928,8 @@ const make = Effect.gen(function* () {
       };
       yield* Effect.gen(function* () {
         if (!(yield* fs.exists(worktreePath))) return;
+        if (group.some((member) => member.archivedAt === null && member.deletedAt === null))
+          return keep("referenced by a resumable thread");
         if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
         if (members.length > 1 && worktreeOwner(members) === undefined)
           return keep(`shared by ${members.length} threads`);
@@ -1117,6 +1119,8 @@ const make = Effect.gen(function* () {
             projections.getThreadShell(entry.threadId),
           );
           const latestGroup = latestShells.filter((shell) => shell !== null);
+          if (latestGroup.some((shell) => shell.archivedAt === null && shell.deletedAt === null))
+            return "referenced by a resumable thread";
           const latestOwner = worktreeOwner(deleted ? [thread, ...latestGroup] : latestGroup);
           if (
             latestGroup.length !== group.length ||
