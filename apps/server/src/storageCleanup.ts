@@ -1455,6 +1455,8 @@ const make = Effect.gen(function* () {
           ),
         );
         if (!exists) return;
+        if (group.some((member) => member.archivedAt === null && member.deletedAt === null))
+          return keep("referenced by a resumable thread");
         if (deleted && !settings.worktreeOnDelete) return keep("no rules apply");
         if (members.length > 1 && worktreeOwner(members) === undefined)
           return keep(`shared by ${members.length} threads`);
@@ -1553,6 +1555,8 @@ const make = Effect.gen(function* () {
           const latestKeys = yield* Effect.forEach(latestGroup, (shell) =>
             shell.worktreePath === null ? Effect.succeed(null) : canonical(shell.worktreePath),
           );
+          if (latestGroup.some((shell) => shell.archivedAt === null && shell.deletedAt === null))
+            return "referenced by a resumable thread";
           const latestOwner = worktreeOwner(deleted ? [thread, ...latestGroup] : latestGroup);
           if (
             latestGroup.length !== group.length ||
