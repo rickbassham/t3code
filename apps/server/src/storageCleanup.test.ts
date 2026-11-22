@@ -3567,6 +3567,7 @@ describe("storage cleanup reports and local file policies", () => {
           latestRunStartedAt: minutesAgo(40),
           latestRunCompletedAt: minutesAgo(20),
           updatedAt: minutesAgo(20),
+          archivedAt: null,
         });
         setThreads([thread]);
 
@@ -3574,7 +3575,15 @@ describe("storage cleanup reports and local file policies", () => {
         expect(report.entries[0]).toMatchObject({ outcome: "kept" });
         expect(yield* fs.exists(worktree)).toBe(true);
 
-        setThreads([{ ...thread, settledAt: minutesAgo(10), updatedAt: minutesAgo(10) }]);
+        // Deploy-only: an unarchived thread keeps its worktree, so the settled thread is archived.
+        setThreads([
+          {
+            ...thread,
+            archivedAt: minutesAgo(10),
+            settledAt: minutesAgo(10),
+            updatedAt: minutesAgo(10),
+          },
+        ]);
         const settled = yield* service.runNow;
         expect(settled.entries[0]).toMatchObject({
           outcome: "removed",

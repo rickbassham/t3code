@@ -72,6 +72,7 @@ it.layer(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer))("GitWorkflowServi
         GitWorkflowService.layer.pipe(
           Layer.provide(Layer.mock(VcsDriverRegistry.VcsDriverRegistry)({})),
           Layer.provide(Layer.mock(GitManager.GitManager)({})),
+          Layer.provide(Layer.mock(WorktreeProtection.WorktreeProtection)({})),
           Layer.provide(
             Layer.mock(GitVcsDriver.GitVcsDriver)({
               execute: (input) => Effect.die(`spawned Git in ${input.cwd}`),
