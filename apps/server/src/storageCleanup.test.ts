@@ -44,6 +44,7 @@ import * as TerminalManager from "./terminal/Manager.ts";
 import { CodexProviderCapabilitiesV2 } from "./orchestration-v2/Adapters/CodexAdapterV2.ts";
 import { ServerActivation } from "./serverActivation.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
+import * as WorktreeProtection from "./workspace/WorktreeProtection.ts";
 import { describe, expect, it } from "@effect/vitest";
 import {
   CheckpointScopeId,
@@ -381,7 +382,9 @@ const cleanupFixture = (
     };
     let events: Stream.Stream<OrchestrationV2DomainEvent> = Stream.empty;
     const activated = yield* Deferred.make<void>();
-    const context = yield* Layer.build(StorageCleanup.layer).pipe(
+    const context = yield* Layer.build(
+      StorageCleanup.layer.pipe(Layer.provideMerge(WorktreeProtection.layer)),
+    ).pipe(
       Effect.provideService(GitVcsDriver.GitVcsDriver, {
         ...git,
         execute: (input) =>
@@ -544,6 +547,7 @@ const cleanupFixture = (
     );
     return {
       service: Context.get(context, StorageCleanup.StorageCleanup),
+      protection: Context.get(context, WorktreeProtection.WorktreeProtection),
       repo,
       setTaskFolders: (service: typeof taskFolders) => {
         taskFolders = service;
@@ -4024,6 +4028,22 @@ describe("storage cleanup reports and local file policies", () => {
           outcome: "kept",
           reason: "No expired files",
         });
+      }),
+    ),
+  );
+  it.live("removes a worktree that T3 locked for its thread", () =>
+    runCleanupTest(
+      Effect.gen(function* () {
+        const { service, protection, repo, config, command, setThreads, fs } =
+          yield* cleanupFixture();
+        // T3 locks only worktrees at managed-folder/repository/branch.
+        const worktree = `${config.worktreesDir}/repository/locked`;
+        yield* command(repo, ["worktree", "add", "-b", "locked", worktree]);
+        setThreads([shell({ branch: "locked", worktreePath: worktree })]);
+        yield* protection.reconcile(repo);
+        const report = yield* service.runNow;
+        expect(report.entries[0]).toMatchObject({ outcome: "removed" });
+        expect(yield* fs.exists(worktree)).toBe(false);
       }),
     ),
   );

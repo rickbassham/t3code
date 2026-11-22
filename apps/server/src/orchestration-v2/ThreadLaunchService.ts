@@ -1132,7 +1132,10 @@ const make = Effect.gen(function* () {
             yield* Effect.suspend((): Effect.Effect<void, GitCommandError | TaskFolderError> =>
               removedTaskFolder === null
                 ? git
-                    .removeWorktree({ cwd: project.workspaceRoot, path: removedPath, force: true })
+                    .removeWorktree(
+                      { cwd: project.workspaceRoot, path: removedPath, force: true },
+                      { exceptThreadId: threadId },
+                    )
                     .pipe(
                       Effect.andThen(
                         removedBranch === null
