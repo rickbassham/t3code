@@ -151,6 +151,7 @@ import * as TaskFolderStore from "./workspace/TaskFolderStore.ts";
 import * as KnownWorkspaces from "./workspace/KnownWorkspaces.ts";
 import * as WorkspaceFileSystem from "./workspace/WorkspaceFileSystem.ts";
 import * as WorkspacePaths from "./workspace/WorkspacePaths.ts";
+import * as WorktreeProtection from "./workspace/WorktreeProtection.ts";
 import * as GitVcsDriver from "./vcs/GitVcsDriver.ts";
 import * as VcsAutomaticFetchInterval from "./vcs/VcsAutomaticFetchInterval.ts";
 import * as VcsDriverRegistry from "./vcs/VcsDriverRegistry.ts";
@@ -243,6 +244,7 @@ import * as ThreadIssueService from "./orchestration-v2/ThreadIssueService.ts";
 import * as RunFinalizationService from "./orchestration-v2/RunFinalizationService.ts";
 import * as ProjectionMaintenance from "./orchestration-v2/ProjectionMaintenance.ts";
 import * as ProjectionStoreV2 from "./orchestration-v2/ProjectionStore.ts";
+import * as WorktreeProtectionSync from "./orchestration-v2/WorktreeProtectionSync.ts";
 import { makePersistedServerRuntimeState } from "./serverRuntimeState.ts";
 import { closeNonPrivateNetworkConnections, loopbackUrlHostForAddress } from "./startupAccess.ts";
 import * as OrchestrationHttp from "./orchestration-v2/http.ts";
@@ -489,7 +491,12 @@ const layerGit = Layer.empty.pipe(
   Layer.provideMerge(GitVcsDriver.layer),
 );
 
+const layerWorktreeProtection = WorktreeProtection.layer.pipe(
+  Layer.provide(Layer.merge(ProjectionStoreV2.layer, GitVcsDriver.layer)),
+);
+
 const layerGitWorkflow = GitWorkflowService.layer.pipe(
+  Layer.provide(layerWorktreeProtection),
   Layer.provideMerge(layerVcsDriverRegistry),
   Layer.provideMerge(layerGit),
 );
@@ -740,7 +747,11 @@ const layerRuntimeCoreDependenciesBase = Layer.mergeAll(
   HeldHooksWaker.layer,
   layerThreadSettlementWorker,
   layerIdleCompactionWorker,
-  StorageCleanup.layer.pipe(Layer.provide(ProjectionStoreV2.layer)),
+  StorageCleanup.layer.pipe(
+    Layer.provide(ProjectionStoreV2.layer),
+    Layer.provide(layerWorktreeProtection),
+  ),
+  WorktreeProtectionSync.layer.pipe(Layer.provide(layerWorktreeProtection)),
   DatabaseStorage.layer.pipe(
     Layer.provide(ProjectionMaintenance.layer),
     Layer.provide(layerServerRestart),

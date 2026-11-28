@@ -64,6 +64,7 @@ import { isNonRepositoryGitStderr } from "./vcs/GitVcsDriverCore.ts";
 import { isLinkedWorktree, removeLinkedWorktree } from "./vcs/worktreeRemoval.ts";
 import * as TaskFolders from "./workspace/TaskFolders.ts";
 import { withWorkspaceLease } from "./workspace/workspaceLease.ts";
+import * as WorktreeProtection from "./workspace/WorktreeProtection.ts";
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { isNetworkPath } from "@t3tools/shared/path";
@@ -338,6 +339,7 @@ const make = Effect.gen(function* () {
   const gitWorkflow = yield* GitWorkflowService.GitWorkflowService;
   const reconcileBranch = yield* WorktreeBranchSync.makeReconcile;
   const terminals = yield* TerminalManager.TerminalManager;
+  const protection = yield* WorktreeProtection.WorktreeProtection;
   const fs = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const taskFolders = yield* TaskFolders.TaskFolders;
@@ -1920,15 +1922,18 @@ const make = Effect.gen(function* () {
             if (settings.worktreeKeepWhen === "tracked-changes" && !submodules.force)
               yield* cleanupGit(worktreePath, ["clean", "-ffdx"], "git clean");
             const adminDir = yield* worktreeAdminDir(worktreePath);
-            yield* removeLinkedWorktree({
-              operation: "StorageCleanup.cleanupGit",
-              cwd: repository,
-              worktreePath,
-              // Git requires force for submodules; recursive checks above cannot make removal atomic.
-              force: submodules.force,
-              execute: git.execute,
-              run: (args) => cleanupGit(repository, [...args], "git worktree remove"),
-            }).pipe(Effect.tapError(() => noteLeftover(adminDir, entry)));
+            yield* protection.withoutLock(
+              { cwd: repository, path: worktreePath },
+              removeLinkedWorktree({
+                operation: "StorageCleanup.cleanupGit",
+                cwd: repository,
+                worktreePath,
+                // Git requires force for submodules; recursive checks above cannot make removal atomic.
+                force: submodules.force,
+                execute: git.execute,
+                run: (args) => cleanupGit(repository, [...args], "git worktree remove"),
+              }).pipe(Effect.tapError(() => noteLeftover(adminDir, entry))),
+            );
             entries.push({ ...entry, outcome: "removed", reason: sentence(removalReason), bytes });
             yield* gitManager.invalidateStatus(project.workspaceRoot);
             // Preserve branch/path so ProviderTurnStartService can recreate the checkout on resume.
